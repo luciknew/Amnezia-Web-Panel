@@ -637,7 +637,7 @@
                 switchConfigTab('conf');
                 closeModal('addUserModal');
                 openModal('configModal');
-                generateQR((body.protocol === 'awg' || body.protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             } else {
                 setTimeout(() => window.location.reload(), 500);
             }
@@ -765,7 +765,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR((body.protocol === 'awg' || body.protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             }
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -824,13 +824,31 @@
         document.getElementById(panels[tab]).classList.add('active');
     }
 
-    function generateQR(text) {
+    let _qrRotateTimer = null;
+    function generateQR(payload) {
         const container = document.getElementById('qrCode');
         container.innerHTML = '';
-        try {
-            new QRCode(container, { text, width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
-        } catch (e) {
-            container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+        if (_qrRotateTimer) { clearInterval(_qrRotateTimer); _qrRotateTimer = null; }
+        const chunks = Array.isArray(payload) ? payload : [payload];
+        let idx = 0;
+        let counterEl = null;
+        if (chunks.length > 1) {
+            counterEl = document.createElement('div');
+            counterEl.style.cssText = 'text-align:center;margin-top:0.5rem;color:var(--text-muted);font-size:0.85rem;';
+            container.insertAdjacentElement('afterend', counterEl);
+        }
+        const render = () => {
+            container.innerHTML = '';
+            try {
+                new QRCode(container, { text: chunks[idx], width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
+                if (counterEl) counterEl.textContent = `${idx + 1} / ${chunks.length}`;
+            } catch (e) {
+                container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+            }
+        };
+        render();
+        if (chunks.length > 1) {
+            _qrRotateTimer = setInterval(() => { idx = (idx + 1) % chunks.length; render(); }, 750);
         }
     }
     async function showUserConnectionConfig(serverId, clientId, protocol, connName) {
@@ -848,7 +866,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR((protocol === 'awg' || protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');

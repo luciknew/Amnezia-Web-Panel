@@ -247,19 +247,18 @@ def _parse_wg_conf(text: str) -> dict:
     return sections
 
 
-def _amnezia_pack(json_str: str) -> str:
-    # Qt's qCompress: 4-byte big-endian uncompressed size + standard zlib stream
-    # (zlib header + deflate + adler32 — exactly what zlib.compress emits).
-    raw = json_str.encode('utf-8')
-    packed = struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
-    b64 = base64.urlsafe_b64encode(packed).rstrip(b'=').decode('ascii')
+def _build_amnezia_awg_link(config_text: str, container: str) -> str:
+    """Build a native Amnezia `vpn://` link for AmneziaWG / AmneziaWG 2.0,
+    matching the format the official Amnezia client accepts as pasted text.
+    Reference: https://github.com/auswuchs/awg-converter (MIT)."""
+    blob = _amnezia_compressed_blob(config_text, container)
+    b64 = base64.urlsafe_b64encode(blob).rstrip(b'=').decode('ascii')
     return f"vpn://{b64}"
 
 
-def _build_amnezia_awg_link(config_text: str, container: str) -> str:
-    """Build a native Amnezia `vpn://` link for AmneziaWG / AmneziaWG 2.0,
-    matching the format the official Amnezia client scans from QR codes.
-    Reference: https://github.com/auswuchs/awg-converter (MIT)."""
+def _amnezia_compressed_blob(config_text: str, container: str) -> bytes:
+    """Build the qCompress'd JSON blob that Amnezia's vpn:// wraps in base64.
+    Returned bytes are exactly what gets split into QR chunks (see below)."""
     conf = _parse_wg_conf(config_text)
     iface = conf.get('interface', {})
     peer = conf.get('peer', {})
@@ -310,7 +309,6 @@ def _build_amnezia_awg_link(config_text: str, container: str) -> str:
         'psk_key': psk,
         'server_pub_key': pub_key,
     }
-
     awg_obj = {
         **awg_params,
         'last_config': json.dumps(last_config, separators=(',', ':')),
@@ -320,7 +318,6 @@ def _build_amnezia_awg_link(config_text: str, container: str) -> str:
     }
     if container == 'amnezia-awg2':
         awg_obj['protocol_version'] = '2'
-
     payload = {
         'containers': [{'awg': awg_obj, 'container': container}],
         'defaultContainer': container,
@@ -329,7 +326,53 @@ def _build_amnezia_awg_link(config_text: str, container: str) -> str:
         'dns2': dns2,
         'hostName': host,
     }
-    return _amnezia_pack(json.dumps(payload, separators=(',', ':')))
+    raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    # Qt qCompress: 4-byte big-endian uncompressed size + standard zlib stream
+    return struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+
+
+# Amnezia mobile QR scanner expects multi-chunk frames with this magic prefix.
+# Source: amnezia-client/client/core/utils/qrCodeUtils.{h,cpp}.
+_AMNEZIA_QR_MAGIC = 1984  # 0x07C0, qint16 big-endian
+_AMNEZIA_QR_CHUNK_SIZE = 850  # bytes of raw blob per chunk (matches client)
+
+
+def _amnezia_qr_chunks_from_blob(blob: bytes) -> list:
+    """Split the qCompress'd Amnezia blob into base64url QR chunks.
+
+    Each chunk's binary layout:
+        qint16 BE  magic = 1984
+        quint8     total_chunks
+        quint8     chunk_index (0-based)
+        bytes      up to 850 bytes of the blob
+    Result is base64url-encoded without padding (matches Qt
+    Base64UrlEncoding | OmitTrailingEquals)."""
+    total = max(1, (len(blob) + _AMNEZIA_QR_CHUNK_SIZE - 1) // _AMNEZIA_QR_CHUNK_SIZE)
+    if total > 255:
+        # quint8 ceiling — should never happen for realistic VPN configs.
+        raise ValueError(f"Config too large to chunk: {len(blob)} bytes")
+    chunks = []
+    for i in range(total):
+        slice_ = blob[i * _AMNEZIA_QR_CHUNK_SIZE:(i + 1) * _AMNEZIA_QR_CHUNK_SIZE]
+        frame = struct.pack('>hBB', _AMNEZIA_QR_MAGIC, total, i) + slice_
+        chunks.append(base64.urlsafe_b64encode(frame).rstrip(b'=').decode('ascii'))
+    return chunks
+
+
+def generate_vpn_qr_chunks(config_text: str, protocol: str = '') -> list:
+    """For AWG/AWG2 return the list of base64url QR-chunk strings expected by
+    the official Amnezia mobile scanner. For other protocols return [] —
+    callers fall back to a single QR built from `config` or `vpn_link`."""
+    if not config_text:
+        return []
+    container = {'awg': 'amnezia-awg', 'awg2': 'amnezia-awg2'}.get(protocol)
+    if not container:
+        return []
+    try:
+        return _amnezia_qr_chunks_from_blob(_amnezia_compressed_blob(config_text, container))
+    except Exception:
+        logger.exception("Failed to build Amnezia QR chunks for %s", protocol)
+        return []
 
 
 def generate_vpn_link(config_text, protocol: str = ''):
@@ -2043,6 +2086,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
 
         if result.get('config'):
             result['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
+            result['qr_chunks'] = generate_vpn_qr_chunks(result['config'], req.protocol)
 
         # Link connection to user if specified
         if req.user_id and result.get('client_id'):
@@ -2154,7 +2198,8 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
             config = manager.get_client_config(req.protocol, req.client_id, get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config, req.protocol) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        qr_chunks = generate_vpn_qr_chunks(config, req.protocol) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2320,6 +2365,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
                         result['vpn_link'] = generate_vpn_link(conn_result['config'], req.protocol)
+                        result['qr_chunks'] = generate_vpn_qr_chunks(conn_result['config'], req.protocol)
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -2463,6 +2509,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         if result.get('config'):
             resp['config'] = result['config']
             resp['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
+            resp['qr_chunks'] = generate_vpn_qr_chunks(result['config'], req.protocol)
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
@@ -2606,7 +2653,8 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting shared config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2638,7 +2686,8 @@ async def api_my_connection_config(request: Request, connection_id: str):
         config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)

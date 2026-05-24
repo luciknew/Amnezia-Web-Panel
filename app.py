@@ -84,7 +84,21 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+# Persist storage in a dedicated subdirectory so a single bind-mount/volume
+# (./data:/app/data) survives container rebuilds without overlaying source code.
+DATA_DIR = os.environ.get('DATA_DIR') or os.path.join(application_path, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, 'data.json')
+
+# One-shot migration: if a legacy data.json sits next to app.py (pre-mount
+# layout), move it into DATA_DIR so existing installs don't lose anything.
+_legacy_data = os.path.join(application_path, 'data.json')
+if os.path.exists(_legacy_data) and not os.path.exists(DATA_FILE):
+    try:
+        os.replace(_legacy_data, DATA_FILE)
+    except OSError:
+        pass
+
 CURRENT_VERSION = "v1.4.3"
 
 

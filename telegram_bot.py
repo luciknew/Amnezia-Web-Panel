@@ -277,7 +277,7 @@ async def _handle_get_config(
                 await api.edit_message(chat_id, loading_msg_id, "❌ Failed to retrieve configuration.")
             return
 
-        vpn_link = generate_vpn_link_fn(config) if config else ""
+        vpn_link = generate_vpn_link_fn(config, proto) if config else ""
 
         # Delete loading message
         if loading_msg_id:
@@ -313,7 +313,7 @@ async def _handle_get_config(
                     await api.send_message(chat_id, f"<b>📄 Configuration (part {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>")
 
             # VPN deep-link (vpn:// base64 URI for the Amnezia app)
-            vpn_link = generate_vpn_link_fn(config)
+            vpn_link = generate_vpn_link_fn(config, proto)
             if vpn_link:
                 await api.send_message(
                     chat_id,

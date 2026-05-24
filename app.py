@@ -4,6 +4,8 @@ import json
 import logging
 import base64
 import hashlib
+import struct
+import zlib
 import secrets
 import uuid
 import asyncio
@@ -204,7 +206,139 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
-def generate_vpn_link(config_text):
+_AWG_OBFUSCATION_KEYS = (
+    'H1', 'H2', 'H3', 'H4',
+    'S1', 'S2', 'S3', 'S4',
+    'Jc', 'Jmin', 'Jmax',
+    'I1', 'I2', 'I3', 'I4', 'I5',
+)
+
+
+def _parse_wg_conf(text: str) -> dict:
+    """Parse a WireGuard/AmneziaWG .conf into {'interface': {...}, 'peer': {...}}."""
+    sections: dict = {}
+    cur = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            cur = line[1:-1].strip().lower()
+            sections.setdefault(cur, {})
+            continue
+        if '=' not in line or cur is None:
+            continue
+        key, _, val = line.partition('=')
+        sections[cur][key.strip()] = val.strip()
+    return sections
+
+
+def _amnezia_pack(json_str: str) -> str:
+    # Qt's qCompress: 4-byte big-endian uncompressed size + standard zlib stream
+    # (zlib header + deflate + adler32 — exactly what zlib.compress emits).
+    raw = json_str.encode('utf-8')
+    packed = struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+    b64 = base64.urlsafe_b64encode(packed).rstrip(b'=').decode('ascii')
+    return f"vpn://{b64}"
+
+
+def _build_amnezia_awg_link(config_text: str, container: str) -> str:
+    """Build a native Amnezia `vpn://` link for AmneziaWG / AmneziaWG 2.0,
+    matching the format the official Amnezia client scans from QR codes.
+    Reference: https://github.com/auswuchs/awg-converter (MIT)."""
+    conf = _parse_wg_conf(config_text)
+    iface = conf.get('interface', {})
+    peer = conf.get('peer', {})
+
+    priv_key = iface.get('PrivateKey', '')
+    addr = iface.get('Address', '10.8.0.2/32')
+    dns = iface.get('DNS', '1.1.1.1, 1.0.0.1')
+    mtu = iface.get('MTU', '1280')
+
+    pub_key = peer.get('PublicKey', '')
+    psk = peer.get('PresharedKey', '')
+    allowed = peer.get('AllowedIPs', '0.0.0.0/0, ::/0')
+    endpoint = peer.get('Endpoint', '')
+    keepalive = peer.get('PersistentKeepalive', '25')
+
+    last_colon = endpoint.rfind(':')
+    if last_colon >= 0:
+        host, port_str = endpoint[:last_colon], endpoint[last_colon + 1:]
+    else:
+        host, port_str = endpoint, '51820'
+    try:
+        port_int = int(port_str)
+    except ValueError:
+        port_int = 51820
+
+    dns_parts = [d.strip() for d in dns.split(',')]
+    dns1 = dns_parts[0] if dns_parts else '1.1.1.1'
+    dns2 = dns_parts[1] if len(dns_parts) > 1 else '1.0.0.1'
+
+    client_ip = addr.split('/')[0]
+    subnet = '.'.join(client_ip.split('.')[:3]) + '.0'
+
+    awg_params = {k: iface[k] for k in _AWG_OBFUSCATION_KEYS if k in iface}
+    allowed_arr = [s.strip() for s in allowed.split(',') if s.strip()]
+
+    last_config = {
+        **awg_params,
+        'allowed_ips': allowed_arr,
+        'clientId': '',
+        'client_ip': client_ip,
+        'client_priv_key': priv_key,
+        'client_pub_key': '',
+        'config': config_text.strip(),
+        'hostName': host,
+        'mtu': mtu,
+        'persistent_keep_alive': str(keepalive),
+        'port': port_int,
+        'psk_key': psk,
+        'server_pub_key': pub_key,
+    }
+
+    awg_obj = {
+        **awg_params,
+        'last_config': json.dumps(last_config, separators=(',', ':')),
+        'port': port_str,
+        'subnet_address': subnet,
+        'transport_proto': 'udp',
+    }
+    if container == 'amnezia-awg2':
+        awg_obj['protocol_version'] = '2'
+
+    payload = {
+        'containers': [{'awg': awg_obj, 'container': container}],
+        'defaultContainer': container,
+        'description': f'AWG {host}',
+        'dns1': dns1,
+        'dns2': dns2,
+        'hostName': host,
+    }
+    return _amnezia_pack(json.dumps(payload, separators=(',', ':')))
+
+
+def generate_vpn_link(config_text, protocol: str = ''):
+    """Build the QR-importable link for a generated client config.
+
+    For AmneziaWG / AmneziaWG 2.0 we emit the native Amnezia `vpn://` format
+    (zlib-compressed JSON) so the official Amnezia mobile/desktop client picks
+    it up via QR scan. For every other protocol — including AWG Legacy, plain
+    WireGuard, Xray, Telemt — we keep the original `vpn://base64(raw_conf)`
+    wrapper for backward compatibility.
+    """
+    if not config_text:
+        return ''
+    if protocol == 'awg':
+        try:
+            return _build_amnezia_awg_link(config_text, 'amnezia-awg')
+        except Exception:
+            logger.exception("Failed to build native Amnezia vpn:// for awg, falling back")
+    elif protocol == 'awg2':
+        try:
+            return _build_amnezia_awg_link(config_text, 'amnezia-awg2')
+        except Exception:
+            logger.exception("Failed to build native Amnezia vpn:// for awg2, falling back")
     b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64}"
 
@@ -1894,7 +2028,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         ssh.disconnect()
 
         if result.get('config'):
-            result['vpn_link'] = generate_vpn_link(result['config'])
+            result['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
 
         # Link connection to user if specified
         if req.user_id and result.get('client_id'):
@@ -2005,7 +2139,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         else:
             config = manager.get_client_config(req.protocol, req.client_id, get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
+        vpn_link = generate_vpn_link(config, req.protocol) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
     except Exception as e:
         logger.exception("Error getting connection config")
@@ -2171,7 +2305,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     result['connection_created'] = True
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
-                        result['vpn_link'] = generate_vpn_link(conn_result['config'])
+                        result['vpn_link'] = generate_vpn_link(conn_result['config'], req.protocol)
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -2314,7 +2448,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         resp = {'status': 'success'}
         if result.get('config'):
             resp['config'] = result['config']
-            resp['vpn_link'] = generate_vpn_link(result['config'])
+            resp['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
@@ -2457,7 +2591,7 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
+        vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
     except Exception as e:
         logger.exception("Error getting shared config")
@@ -2489,7 +2623,7 @@ async def api_my_connection_config(request: Request, connection_id: str):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
+        vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
     except Exception as e:
         logger.exception("Error getting my connection config")

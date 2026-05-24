@@ -222,6 +222,39 @@ docker compose version
         
         return params
 
+    @staticmethod
+    def _is_tls_mode(config_text: str) -> bool:
+        """Detect whether the active config has only Fake-TLS mode enabled
+        (`[general.modes]` tls=true, classic=false, secure=false)."""
+        # Pull out just the [general.modes] section, so we don't accidentally
+        # match a `tls = true` line that belongs to some other table.
+        m = re.search(r'\[general\.modes\](.*?)(?=\n\[|\Z)', config_text, re.S)
+        if not m:
+            return False
+        section = m.group(1)
+        tls_match = re.search(r'^\s*tls\s*=\s*(true|false)', section, re.I | re.M)
+        return bool(tls_match and tls_match.group(1).lower() == 'true')
+
+    @staticmethod
+    def _build_fake_tls_secret(secret_hex: str, tls_domain: str) -> str:
+        """Wrap a 32-hex-char (16-byte) MTProxy secret into the Fake-TLS
+        on-wire format that the official Telegram client recognises:
+
+            ee + <16 random bytes hex> + <utf8(tls_domain) hex>
+
+        Returns the new hex secret. If inputs are malformed, returns the
+        secret unchanged so we never produce a worse link than before."""
+        if not secret_hex or not tls_domain:
+            return secret_hex
+        try:
+            # Reject anything that isn't exactly 16 bytes of hex — Fake-TLS
+            # requires that fixed length for the random suffix.
+            if len(secret_hex) != 32 or not all(c in '0123456789abcdefABCDEF' for c in secret_hex):
+                return secret_hex
+            return 'ee' + secret_hex.lower() + tls_domain.encode('utf-8').hex()
+        except Exception:
+            return secret_hex
+
     def remove_container(self, protocol_type=None):
         self.ssh.run_sudo_command(f"docker rm -f {self.CONTAINER_NAME}")
         self.ssh.run_sudo_command("rm -rf /opt/amnezia/telemt")
@@ -363,10 +396,17 @@ docker compose version
         
         # Fetch the official link from API (it includes TLS emulation padding like 'ee...' if enabled)
         link = self.get_client_config(protocol_type, username, host, port)
-        
-        # Extreme fallback if API is slow or 404
+
+        # Extreme fallback if API is slow or 404 (e.g. container in restart loop
+        # right after install). Without this, admins get a flat secret that
+        # Telemt refuses in Fake-TLS-only mode. Reconstruct the proper format
+        # from what we already know locally.
         if link == "Not found":
-            link = f"tg://proxy?server={host}&port={port}&secret={secret}"
+            params = self._parse_telemt_params(config_text)
+            wire_secret = secret
+            if self._is_tls_mode(config_text) and params.get('tls_domain'):
+                wire_secret = self._build_fake_tls_secret(secret, params['tls_domain'])
+            link = f"tg://proxy?server={host}&port={port}&secret={wire_secret}"
         
         return {
             "client_id": username,
@@ -526,10 +566,19 @@ docker compose version
             if links.get('tls'): return links['tls'][0]
             if links.get('secure'): return links['secure'][0]
             if links.get('classic'): return links['classic'][0]
-            
+
+        # API unreachable — try to assemble the link from the config we have
+        # on disk (matches the Fake-TLS format Telemt would generate itself).
         clients = self.get_clients(protocol_type)
         c = next((c for c in clients if c['clientId'] == client_id), None)
         if c:
             secret = c.get('userData', {}).get('token', '')
-            if secret: return f"tg://proxy?server={host}&port={port}&secret={secret}"
+            if secret:
+                config_text = self._get_server_config()
+                wire_secret = secret
+                if config_text and self._is_tls_mode(config_text):
+                    params = self._parse_telemt_params(config_text)
+                    if params.get('tls_domain'):
+                        wire_secret = self._build_fake_tls_secret(secret, params['tls_domain'])
+                return f"tg://proxy?server={host}&port={port}&secret={wire_secret}"
         return "Not found"

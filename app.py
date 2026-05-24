@@ -1092,7 +1092,7 @@ async def startup():
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
 
 
 def _scrape_server_traffic(server, sid, my_conns):
@@ -2748,7 +2748,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     if tg_cfg.enabled and tg_cfg.token:
         if not tg_bot.is_running():
             logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link)
+            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data)
     else:
         if tg_bot.is_running():
             logger.info("Stopping Telegram bot (settings save)...")
@@ -2775,7 +2775,7 @@ async def api_telegram_toggle(request: Request):
         save_data(data)
         return {'status': 'stopped', 'bot_running': False}
     else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link)
+        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data)
         tg_cfg['enabled'] = True
         data['settings']['telegram'] = tg_cfg
         save_data(data)

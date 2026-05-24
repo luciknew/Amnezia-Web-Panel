@@ -88,7 +88,10 @@
         </div>
     </div>
 
-    <!-- AWG Card -->
+    <!-- AWG Card — hidden in fork: functionally identical to AmneziaWG 2.0,
+         only differs by container name and a `protocol_version: 2` flag in
+         the client JSON. Kept as an HTML comment so we don't drift far from
+         upstream when pulling updates.
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
             <div class="protocol-icon">🔮</div>
@@ -111,6 +114,8 @@
             </button>
         </div>
     </div>
+    -->
+    <div id="proto-awg" style="display:none"></div>
 
     <!-- AWG Legacy Card -->
     <div class="card card-hover protocol-card protocol-legacy" id="proto-awg-legacy">
@@ -357,7 +362,6 @@
         <div class="flex gap-sm items-center">
             <select class="form-select" id="connProtoSelect" onchange="loadConnections()"
                 style="width:auto; min-width:160px;">
-                <option value="awg">AmneziaWG</option>
                 <option value="awg2">AmneziaWG 2.0</option>
                 <option value="awg_legacy">AWG Legacy</option>
                 <option value="xray">Xray</option>
@@ -787,7 +791,7 @@
 
                 for (const [proto, info] of Object.entries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
+                    const isVPN = ['awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -828,7 +832,7 @@
     }
 
     function updateStatusCounts(protocols) {
-        const protos = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
+        const protos = ['awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
         const servs = ['dns', 'adguard', 'socks5'];
 
         let pRunning = 0, pTotal = protos.length;

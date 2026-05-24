@@ -1385,7 +1385,7 @@
                     document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
                     switchConfigTab('conf');
                     openModal('configModal');
-                    generateQR(result.config);
+                    generateQR((proto === 'awg' || proto === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
                 }
             }
             loadConnections();
@@ -1496,7 +1496,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR((proto === 'awg' || proto === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
             }
         } catch (err) {
             showToast('Ошибка: ' + err.message, 'error');

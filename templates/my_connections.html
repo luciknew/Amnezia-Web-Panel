@@ -128,7 +128,7 @@
 
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR((proto === 'awg' || proto === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');

@@ -637,7 +637,7 @@
                 switchConfigTab('conf');
                 closeModal('addUserModal');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR((body.protocol === 'awg' || body.protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
             } else {
                 setTimeout(() => window.location.reload(), 500);
             }
@@ -765,7 +765,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR((body.protocol === 'awg' || body.protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
             }
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -848,7 +848,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR((protocol === 'awg' || protocol === 'awg2') && result.vpn_link ? result.vpn_link : result.config);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');

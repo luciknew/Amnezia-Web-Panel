@@ -1,15 +1,13 @@
-version: '3.8'
-
 services:
   amnezia_panel:
-    image: prvtpro/amnezia-panel:1.4.3
+    build: .
     container_name: amnezia_panel
 
     ports:
       - "${APP_PORT:-5000}:5000"
 
     volumes:
-      - amnezia_data:/app/data
+      - ./data:/app/data
 
     restart: unless-stopped
 
@@ -19,6 +17,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-
-volumes:
-  amnezia_data:

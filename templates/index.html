@@ -16,7 +16,8 @@
     <div class="server-grid" id="serverGrid">
         {% for server in servers %}
         <div class="card card-hover server-card" id="server-{{ loop.index0 }}" data-idx="{{ loop.index0 }}"
-            data-name="{{ server.name }}" data-host="{{ server.host }}" data-port="{{ server.ssh_port }}"
+            data-name="{{ server.name }}" data-host="{{ server.host }}"
+            data-client-host="{{ server.client_host or '' }}" data-port="{{ server.ssh_port }}"
             data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
             draggable="true">
             <div class="server-meta">
@@ -109,6 +110,12 @@
             </div>
 
             <div class="form-group">
+                <label class="form-label">{{ _('client_host') }}</label>
+                <input class="form-input" type="text" id="editServerClientHost" placeholder="vpn.example.com">
+                <div class="form-hint">{{ _('client_host_hint') }}</div>
+            </div>
+
+            <div class="form-group">
                 <label class="form-label">{{ _('ssh_user') }}</label>
                 <input class="form-input" type="text" id="editServerUser" required>
             </div>
@@ -171,6 +178,12 @@
                     <label class="form-label">{{ _('ssh_port') }}</label>
                     <input class="form-input" type="number" id="serverPort" value="22" min="1" max="65535">
                 </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('client_host') }}</label>
+                <input class="form-input" type="text" id="serverClientHost" placeholder="vpn.example.com">
+                <div class="form-hint">{{ _('client_host_hint') }}</div>
             </div>
 
             <div class="form-group">
@@ -239,6 +252,7 @@
             const data = {
                 name: document.getElementById('serverName').value,
                 host: document.getElementById('serverHost').value,
+                client_host: document.getElementById('serverClientHost').value,
                 ssh_port: parseInt(document.getElementById('serverPort').value) || 22,
                 username: document.getElementById('serverUser').value,
                 password: document.getElementById('serverPassword').value,
@@ -287,6 +301,7 @@
         document.getElementById('editServerIdx').value = card.dataset.idx;
         document.getElementById('editServerName').value = card.dataset.name || '';
         document.getElementById('editServerHost').value = card.dataset.host || '';
+        document.getElementById('editServerClientHost').value = card.dataset.clientHost || '';
         document.getElementById('editServerPort').value = card.dataset.port || '22';
         document.getElementById('editServerUser').value = card.dataset.username || '';
         document.getElementById('editServerPassword').value = '';
@@ -315,6 +330,7 @@
             const body = {
                 name: document.getElementById('editServerName').value,
                 host: document.getElementById('editServerHost').value,
+                client_host: document.getElementById('editServerClientHost').value,
                 ssh_port: parseInt(document.getElementById('editServerPort').value) || 22,
                 username: document.getElementById('editServerUser').value,
                 // Empty -> null means "leave unchanged" on the backend.

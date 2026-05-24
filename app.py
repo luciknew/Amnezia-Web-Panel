@@ -166,6 +166,13 @@ def get_ssh(server):
     )
 
 
+def get_client_host(server):
+    # Address embedded into client VPN configs. May differ from SSH host
+    # when the server is behind NAT and reachable via different addresses
+    # for admin (SSH) and for end-user VPN traffic.
+    return (server.get('client_host') or '').strip() or server['host']
+
+
 def get_protocol_manager(ssh, protocol: str):
     if protocol == 'xray':
         from managers.xray_manager import XrayManager
@@ -393,9 +400,9 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
                 manager = get_protocol_manager(ssh, c_req['protocol'])
                 
                 if c_req['protocol'] == 'wireguard':
-                    res = await asyncio.to_thread(manager.add_client, c_req['name'], srv['host'])
+                    res = await asyncio.to_thread(manager.add_client, c_req['name'], get_client_host(srv))
                 else:
-                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], srv['host'], port)
+                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], get_client_host(srv), port)
                 
                 if res.get('client_id'):
                     new_conn = {
@@ -606,6 +613,7 @@ class LoginRequest(BaseModel):
 
 class AddServerRequest(BaseModel):
     host: str = ''
+    client_host: str = ''
     ssh_port: int = 22
     username: str = ''
     password: str = ''
@@ -616,6 +624,8 @@ class AddServerRequest(BaseModel):
 class EditServerRequest(BaseModel):
     name: str = ''
     host: str = ''
+    # None = keep current, '' = clear (falls back to SSH host), value = set.
+    client_host: Optional[str] = None
     ssh_port: int = 22
     username: str = ''
     # Optional[str] = None lets the client distinguish "leave field as is"
@@ -1200,7 +1210,9 @@ async def api_add_server(request: Request, req: AddServerRequest):
             return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
 
         server = {
-            'name': name, 'host': host, 'ssh_port': req.ssh_port,
+            'name': name, 'host': host,
+            'client_host': (req.client_host or '').strip(),
+            'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
             'protocols': {},
@@ -1256,6 +1268,9 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
 
         server['name'] = new_name
         server['host'] = new_host
+        # None = keep current, otherwise overwrite (empty string clears it).
+        if req.client_host is not None:
+            server['client_host'] = req.client_host.strip()
         server['ssh_port'] = new_port
         server['username'] = new_user
         server['password'] = new_pass
@@ -1864,7 +1879,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         
         if req.protocol == 'telemt':
             result = manager.add_client(
-                req.protocol, req.name, server['host'], port,
+                req.protocol, req.name, get_client_host(server), port,
                 telemt_quota=req.telemt_quota,
                 telemt_max_ips=req.telemt_max_ips,
                 telemt_expiry=req.telemt_expiry,
@@ -1873,9 +1888,9 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
                 max_tcp_conns=req.telemt_max_conns
             )
         elif req.protocol == 'wireguard':
-            result = manager.add_client(req.name, server['host'])
+            result = manager.add_client(req.name, get_client_host(server))
         else:
-            result = manager.add_client(req.protocol, req.name, server['host'], port)
+            result = manager.add_client(req.protocol, req.name, get_client_host(server), port)
         ssh.disconnect()
 
         if result.get('config'):
@@ -1986,9 +2001,9 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         if req.protocol == 'wireguard':
-            config = manager.get_client_config(req.client_id, server['host'])
+            config = manager.get_client_config(req.client_id, get_client_host(server))
         else:
-            config = manager.get_client_config(req.protocol, req.client_id, server['host'], port)
+            config = manager.get_client_config(req.protocol, req.client_id, get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
@@ -2128,7 +2143,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                 manager = get_protocol_manager(ssh, req.protocol)
                 if req.protocol == 'telemt':
                     conn_result = manager.add_client(
-                        req.protocol, conn_name, server['host'], port,
+                        req.protocol, conn_name, get_client_host(server), port,
                         telemt_quota=req.telemt_quota,
                         telemt_max_ips=req.telemt_max_ips,
                         telemt_expiry=req.telemt_expiry,
@@ -2137,7 +2152,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                         max_tcp_conns=req.telemt_max_conns
                     )
                 else:
-                    conn_result = manager.add_client(req.protocol, conn_name, server['host'], port)
+                    conn_result = manager.add_client(req.protocol, conn_name, get_client_host(server), port)
                 ssh.disconnect()
 
                 if conn_result.get('client_id'):
@@ -2263,13 +2278,13 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(manager.get_client_config, req.protocol, req.client_id, server['host'], port)
+            config = await asyncio.to_thread(manager.get_client_config, req.protocol, req.client_id, get_client_host(server), port)
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
             if req.protocol == 'telemt':
                 result = await asyncio.to_thread(
-                    manager.add_client, req.protocol, req.name, server['host'], port,
+                    manager.add_client, req.protocol, req.name, get_client_host(server), port,
                     telemt_quota=req.telemt_quota,
                     telemt_max_ips=req.telemt_max_ips,
                     telemt_expiry=req.telemt_expiry,
@@ -2278,7 +2293,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                     max_tcp_conns=req.telemt_max_conns
                 )
             else:
-                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, server['host'], port)
+                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, get_client_host(server), port)
         
         await asyncio.to_thread(ssh.disconnect)
 
@@ -2440,7 +2455,7 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         ssh.connect()
         # Use appropriate manager for the protocol
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], server['host'], port)
+        config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
@@ -2472,7 +2487,7 @@ async def api_my_connection_config(request: Request, connection_id: str):
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], server['host'], port)
+        config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config) if config else ''
         return {'config': config, 'vpn_link': vpn_link}

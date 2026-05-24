@@ -340,11 +340,17 @@ _AMNEZIA_QR_CHUNK_SIZE = 850  # bytes of raw blob per chunk (matches client)
 def _amnezia_qr_chunks_from_blob(blob: bytes) -> list:
     """Split the qCompress'd Amnezia blob into base64url QR chunks.
 
-    Each chunk's binary layout:
+    Each chunk is the QDataStream serialization (default Qt 5/6 version,
+    big-endian) of: qint16 magic, quint8 chunksCount, quint8 chunkIndex,
+    QByteArray data. QDataStream prefixes every QByteArray with its length
+    as a quint32 (or 0xFFFFFFFF for a null array), so the on-wire layout is:
+
         qint16 BE  magic = 1984
         quint8     total_chunks
         quint8     chunk_index (0-based)
+        quint32 BE data_length
         bytes      up to 850 bytes of the blob
+
     Result is base64url-encoded without padding (matches Qt
     Base64UrlEncoding | OmitTrailingEquals)."""
     total = max(1, (len(blob) + _AMNEZIA_QR_CHUNK_SIZE - 1) // _AMNEZIA_QR_CHUNK_SIZE)
@@ -354,7 +360,7 @@ def _amnezia_qr_chunks_from_blob(blob: bytes) -> list:
     chunks = []
     for i in range(total):
         slice_ = blob[i * _AMNEZIA_QR_CHUNK_SIZE:(i + 1) * _AMNEZIA_QR_CHUNK_SIZE]
-        frame = struct.pack('>hBB', _AMNEZIA_QR_MAGIC, total, i) + slice_
+        frame = struct.pack('>hBBI', _AMNEZIA_QR_MAGIC, total, i, len(slice_)) + slice_
         chunks.append(base64.urlsafe_b64encode(frame).rstrip(b'=').decode('ascii'))
     return chunks
 

@@ -30,6 +30,9 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.email_manager import (
+    SMTPSettings, EmailAttachment, send_email as smtp_send_email, render_qr_png,
+)
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -157,6 +160,12 @@ def load_data():
             'remnawave_server_id': 0,
             'remnawave_protocol': 'awg'
         }
+    })
+    # Ensure the email settings block exists even on installations that pre-date
+    # the EMAIL feature, so settings.html template lookups don't crash.
+    data['settings'].setdefault('email', {
+        'host': '', 'port': 587, 'username': '', 'password': '',
+        'from_email': '', 'from_name': '', 'encryption': 'starttls',
     })
     return data
 
@@ -790,6 +799,7 @@ def tpl(request, template, **kwargs):
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
         'telegram_settings': data.get('settings', {}).get('telegram', {}),
+        'email_settings': data.get('settings', {}).get('email', {}),
         'bot_running': tg_bot.is_running(),
         'lang': lang,
         '_': lambda text_id: _t(text_id, lang),
@@ -961,6 +971,17 @@ class TelegramSettings(BaseModel):
     enabled: bool = False
 
 
+class EmailSettings(BaseModel):
+    # SMTP credentials live only in data.json (not in env vars) so the admin
+    # can swap providers from the UI without rebuilding the container.
+    host: str = ''
+    port: int = 587
+    username: str = ''
+    password: str = ''
+    from_email: str = ''
+    from_name: str = ''
+    # "starttls" (587), "ssl" (465), or "none".
+    encryption: str = 'starttls'
 
 
 class UpdateUserRequest(BaseModel):
@@ -980,10 +1001,24 @@ class SaveSettingsRequest(BaseModel):
     captcha: CaptchaSettings
     telegram: TelegramSettings
     ssl: SSLSettings
+    email: Optional[EmailSettings] = None
 
 
 class ToggleUserRequest(BaseModel):
     enabled: bool
+
+
+class SendUserEmailRequest(BaseModel):
+    # IDs of user_connections to package as attachments.
+    connection_ids: List[str] = []
+    subject: Optional[str] = None
+    message: Optional[str] = None
+
+
+class EmailTestRequest(BaseModel):
+    # Optional recipient — defaults to the from_email if not given, so admins
+    # can send themselves a test without typing it.
+    to: Optional[str] = None
 
 
 class AddUserConnectionRequest(BaseModel):
@@ -2539,6 +2574,200 @@ async def api_get_user_connections(request: Request, user_id: str):
     return {'connections': conns}
 
 
+def _fetch_connection_payload(data: dict, conn: dict) -> dict:
+    """Pull the freshly generated config (and matching vpn:// link) for a single
+    user_connections record. Returns dict with `config`, `vpn_link`, `protocol`,
+    `server`, `connection`. Raises on SSH/protocol errors so the caller can log
+    and skip a single broken connection without aborting the whole email."""
+    sid = conn['server_id']
+    if sid >= len(data['servers']):
+        raise RuntimeError(f"Server {sid} no longer exists")
+    server = data['servers'][sid]
+    proto_info = server.get('protocols', {}).get(conn['protocol'], {})
+    port = proto_info.get('port', '55424')
+    ssh = get_ssh(server)
+    ssh.connect()
+    try:
+        manager = get_protocol_manager(ssh, conn['protocol'])
+        config = manager.get_client_config(
+            conn['protocol'], conn['client_id'], get_client_host(server), port
+        )
+    finally:
+        ssh.disconnect()
+    vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
+    return {
+        'config': config or '',
+        'vpn_link': vpn_link,
+        'protocol': conn['protocol'],
+        'server': server,
+        'connection': conn,
+    }
+
+
+def _build_email_attachments_for_connection(payload: dict) -> List[EmailAttachment]:
+    """Pack one connection into MIME parts:
+       - <name>.conf if the protocol uses an INI-style WireGuard config
+       - PNG QR encoding either the vpn:// link (AmneziaWG, where the link is
+         scannable by the official client) or the raw config/URL otherwise."""
+    attachments: List[EmailAttachment] = []
+    conn = payload['connection']
+    protocol = payload['protocol']
+    config = payload['config']
+    vpn_link = payload['vpn_link']
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', conn.get('name') or 'vpn') or 'vpn'
+
+    # INI-style protocols → ship the actual .conf so users can import via file.
+    if protocol in ('awg', 'awg2', 'awg_legacy', 'wireguard') and config:
+        attachments.append(EmailAttachment(
+            filename=f"{safe_name}.conf",
+            content=config.encode('utf-8'),
+            mime_main='text', mime_sub='plain',
+        ))
+
+    # QR target depends on what scanner the user will point at it.
+    # For AWG/AWG2 the official Amnezia client expects the native vpn:// link
+    # (we already build it with the Qt qCompress wrapper in generate_vpn_link).
+    # For everything else the QR holds the raw config/URL — which is exactly
+    # what WireGuard / Xray / Telegram client scanners want.
+    qr_text = vpn_link if protocol in ('awg', 'awg2') and vpn_link else (config or vpn_link)
+    if qr_text:
+        try:
+            png = render_qr_png(qr_text)
+            attachments.append(EmailAttachment(
+                filename=f"{safe_name}.png",
+                content=png,
+                mime_main='image', mime_sub='png',
+            ))
+        except Exception:
+            logger.exception("Failed to render QR PNG for connection %s", conn.get('id'))
+
+    return attachments
+
+
+def _build_email_body(panel_user: dict, payloads: List[dict], custom_message: str) -> str:
+    """Plain-text email body summarising each connection with copy-friendly
+    link/snippet. We keep it text-only (no HTML) so it renders the same in
+    every mail client and the attachments do the heavy lifting."""
+    lines: List[str] = []
+    greeting_name = panel_user.get('username') or 'there'
+    lines.append(f"Hi {greeting_name},")
+    lines.append("")
+    if custom_message:
+        lines.append(custom_message.strip())
+        lines.append("")
+    lines.append(f"You have {len(payloads)} VPN configuration(s) attached:")
+    lines.append("")
+    for i, p in enumerate(payloads, 1):
+        conn = p['connection']
+        server = p['server']
+        proto = p['protocol']
+        server_label = server.get('name') or server.get('host') or '?'
+        lines.append(f"{i}. {conn.get('name') or 'connection'}")
+        lines.append(f"   Server: {server_label}")
+        lines.append(f"   Protocol: {proto}")
+        if proto in ('xray', 'telemt'):
+            # URI-style protocols: the config IS the link, paste it into the app.
+            if p['config']:
+                lines.append(f"   Link: {p['config']}")
+        else:
+            # INI protocols: the .conf attachment is the import target, plus
+            # the vpn:// link for one-tap import on mobile where supported.
+            if p['vpn_link']:
+                lines.append(f"   VPN deep-link: {p['vpn_link']}")
+        lines.append("")
+    lines.append("Scan the attached QR with your VPN app, or import the .conf file directly.")
+    lines.append("")
+    lines.append("— Amnezia Web Panel")
+    return "\n".join(lines)
+
+
+@app.post('/api/users/{user_id}/email/send', tags=["Users"])
+async def api_send_user_email(request: Request, user_id: str, req: SendUserEmailRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.connection_ids:
+        return JSONResponse({'error': 'Select at least one connection'}, status_code=400)
+
+    data = load_data()
+    panel_user = next((u for u in data.get('users', []) if u['id'] == user_id), None)
+    if not panel_user:
+        return JSONResponse({'error': 'User not found'}, status_code=404)
+    to_email = (panel_user.get('email') or '').strip()
+    if not to_email:
+        return JSONResponse({'error': 'User has no email address on file'}, status_code=400)
+
+    smtp = SMTPSettings.from_dict(data.get('settings', {}).get('email', {}) or {})
+    if not smtp.is_configured():
+        return JSONResponse({'error': 'SMTP is not configured (open Settings → Email)'}, status_code=400)
+
+    # Only allow connections belonging to *this* user — defense against an
+    # admin (or compromised session) passing arbitrary connection IDs.
+    user_conns = {c['id']: c for c in data.get('user_connections', []) if c['user_id'] == user_id}
+    requested = [user_conns[cid] for cid in req.connection_ids if cid in user_conns]
+    if not requested:
+        return JSONResponse({'error': 'None of the requested connections belong to this user'}, status_code=400)
+
+    # Pull every config in a thread to avoid blocking the event loop on SSH.
+    payloads: List[dict] = []
+    failures: List[str] = []
+    for conn in requested:
+        try:
+            payload = await asyncio.to_thread(_fetch_connection_payload, data, conn)
+            payloads.append(payload)
+        except Exception as e:
+            logger.exception("Email: failed to fetch config for connection %s", conn.get('id'))
+            failures.append(f"{conn.get('name') or conn.get('id')}: {e}")
+
+    if not payloads:
+        return JSONResponse(
+            {'error': 'Could not fetch any of the selected configs', 'details': failures},
+            status_code=502,
+        )
+
+    attachments: List[EmailAttachment] = []
+    for p in payloads:
+        attachments.extend(_build_email_attachments_for_connection(p))
+
+    subject = (req.subject or '').strip() or 'Your VPN configuration'
+    body = _build_email_body(panel_user, payloads, (req.message or '').strip())
+
+    ok, msg = await smtp_send_email(smtp, to_email, subject, body, attachments)
+    if not ok:
+        return JSONResponse({'error': f'SMTP failed: {msg}', 'partial_failures': failures}, status_code=502)
+
+    return {
+        'status': 'sent',
+        'to': to_email,
+        'sent_count': len(payloads),
+        'attachments': len(attachments),
+        'failed_connections': failures,
+    }
+
+
+@app.post('/api/settings/email/test', tags=["Settings"])
+async def api_email_test(request: Request, req: EmailTestRequest):
+    """Send a no-attachment test message using the current SMTP settings.
+    Lets the admin verify creds without picking a user and connections."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    smtp = SMTPSettings.from_dict(data.get('settings', {}).get('email', {}) or {})
+    if not smtp.is_configured():
+        return JSONResponse({'error': 'SMTP is not configured'}, status_code=400)
+    to = (req.to or smtp.from_email or '').strip()
+    if not to:
+        return JSONResponse({'error': 'No recipient: set "to" or configure from_email'}, status_code=400)
+    ok, msg = await smtp_send_email(
+        smtp, to,
+        subject='Amnezia Web Panel — SMTP test',
+        body='This is a test message confirming that SMTP settings are correct.\n',
+        attachments=[],
+    )
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=502)
+    return {'status': 'sent', 'to': to}
+
+
 # ======================== MY CONNECTIONS API (for user role) ========================
 
 @app.get('/api/my/connections', tags=["Self-service"])
@@ -2740,8 +2969,18 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data['settings']['captcha'] = payload.captcha.dict()
     data['settings']['telegram'] = payload.telegram.dict()
     data['settings']['ssl'] = payload.ssl.dict()
+    if payload.email is not None:
+        # Don't blindly overwrite the password on every save: if the UI sent
+        # back an empty string and we already have one stored, preserve it.
+        # The form leaves the password input empty after save for security
+        # (a non-empty value means "rotate to this new password").
+        new_email = payload.email.dict()
+        current = data['settings'].get('email', {}) or {}
+        if not new_email.get('password') and current.get('password'):
+            new_email['password'] = current['password']
+        data['settings']['email'] = new_email
     save_data(data)
-    logger.info("Settings saved (including captcha and telegram)")
+    logger.info("Settings saved (including captcha, telegram, email)")
 
     # Handle bot start/stop based on new telegram settings
     tg_cfg = payload.telegram

@@ -75,6 +75,75 @@
             </form>
         </div>
 
+        <!-- BLOCK Email / SMTP -->
+        <div class="card">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">📧 Email (SMTP)</h3>
+            <form id="emailForm">
+                <div style="display:grid; grid-template-columns:2fr 1fr; gap:var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label">SMTP host</label>
+                        <input type="text" class="form-input" id="smtp_host"
+                               value="{{ email_settings.host or '' }}"
+                               placeholder="smtp.gmail.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Port</label>
+                        <input type="number" class="form-input" id="smtp_port"
+                               value="{{ email_settings.port or 587 }}" min="1" max="65535">
+                    </div>
+                </div>
+
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-input" id="smtp_username"
+                               value="{{ email_settings.username or '' }}"
+                               placeholder="user@example.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-input" id="smtp_password"
+                               placeholder="{% if email_settings.password %}(unchanged){% else %}app password / SMTP secret{% endif %}">
+                        <div class="form-hint">Leave empty to keep the stored password.</div>
+                    </div>
+                </div>
+
+                <div style="display:grid; grid-template-columns:2fr 1fr 1fr; gap:var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label">From email</label>
+                        <input type="email" class="form-input" id="smtp_from_email"
+                               value="{{ email_settings.from_email or '' }}"
+                               placeholder="vpn-panel@example.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">From name</label>
+                        <input type="text" class="form-input" id="smtp_from_name"
+                               value="{{ email_settings.from_name or '' }}"
+                               placeholder="VPN Panel">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Encryption</label>
+                        <select class="form-select" id="smtp_encryption">
+                            {% set enc = email_settings.encryption or 'starttls' %}
+                            <option value="starttls" {% if enc=='starttls' %}selected{% endif %}>STARTTLS (587)</option>
+                            <option value="ssl"      {% if enc=='ssl'      %}selected{% endif %}>SSL/TLS (465)</option>
+                            <option value="none"     {% if enc=='none'     %}selected{% endif %}>None (plain)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div style="display:flex; gap:var(--space-md); align-items:center; margin-top:var(--space-md);">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="sendEmailTest()">
+                        Send test email
+                    </button>
+                    <span id="emailTestResult" style="font-size:0.85rem; color:var(--text-muted);"></span>
+                </div>
+                <p class="form-hint" style="margin-top: var(--space-sm);">
+                    SMTP credentials are stored in <code>data.json</code>. Configure here, then use the 📧 button on a user card to email them their configs.
+                </p>
+            </form>
+        </div>
+
         <!-- BLOCK 4: API Docs -->
         <div class="card">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('api_docs_title') }}</h3>
@@ -529,11 +598,22 @@
             panel_port: parseInt(document.getElementById('panel_port').value || '5000')
         };
 
+        const email = {
+            host: document.getElementById('smtp_host').value.trim(),
+            port: parseInt(document.getElementById('smtp_port').value || '587'),
+            username: document.getElementById('smtp_username').value.trim(),
+            // Empty -> backend keeps existing password.
+            password: document.getElementById('smtp_password').value,
+            from_email: document.getElementById('smtp_from_email').value.trim(),
+            from_name: document.getElementById('smtp_from_name').value.trim(),
+            encryption: document.getElementById('smtp_encryption').value,
+        };
+
         try {
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl })
+                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, email })
             });
             if (!res.ok) throw new Error(_('error'));
             showToast(_('settings_saved'), 'success');
@@ -543,6 +623,33 @@
         } finally {
             btn.disabled = false;
             spinner.classList.add('hidden');
+        }
+    }
+
+    async function sendEmailTest() {
+        // Sends a test message using whatever is currently SAVED in settings —
+        // the UI doesn't auto-save the SMTP form first, so warn the admin if
+        // they edited fields without saving.
+        const out = document.getElementById('emailTestResult');
+        out.style.color = 'var(--text-muted)';
+        out.textContent = 'Sending...';
+        try {
+            const res = await fetch('/api/settings/email/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                out.style.color = 'var(--danger, #c33)';
+                out.textContent = 'Error: ' + (data.error || res.status);
+                return;
+            }
+            out.style.color = 'var(--success, #1a7f37)';
+            out.textContent = 'Sent to ' + data.to;
+        } catch (e) {
+            out.style.color = 'var(--danger, #c33)';
+            out.textContent = 'Error: ' + e.message;
         }
     }
 

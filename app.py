@@ -2726,11 +2726,12 @@ def _build_email_body_html(panel_user: dict, payloads: List[dict], custom_messag
             f'    {esc(server_label)} &middot; {esc(proto_label)}'
             f'  </div>'
             f'  {link_block}'
-            # QR pinned to 180×180 px (~4.7 cm at 96dpi, fits the ≤5 cm target).
+            # QR pinned to 270×270 px (~7 cm at 96dpi) — comfortable scan size
+            # without dominating the email card.
             f'  <div style="text-align:center; margin:12px 0 4px;">'
             f'    <img src="cid:{esc(cid)}" alt="QR for {esc(conn.get("name") or "config")}" '
-            f'         width="180" height="180" '
-            f'         style="width:180px; height:180px; max-width:5cm; max-height:5cm; '
+            f'         width="270" height="270" '
+            f'         style="width:270px; height:270px; max-width:7.5cm; max-height:7.5cm; '
             f'                display:inline-block; border:1px solid #eee; border-radius:4px;">'
             f'  </div>'
             f'  <div style="text-align:center; font-size:11px; color:#999;">'

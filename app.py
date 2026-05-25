@@ -2605,11 +2605,20 @@ def _fetch_connection_payload(data: dict, conn: dict) -> dict:
     }
 
 
+def _qr_cid_for_connection(conn: dict) -> str:
+    """Stable Content-ID for the connection's inline QR — used by both the
+    attachment builder (to set Content-ID on the part) and the HTML body
+    (to write src="cid:..."), so they refer to the same image."""
+    return f"qr-{conn.get('id', 'unknown')}"
+
+
 def _build_email_attachments_for_connection(payload: dict) -> List[EmailAttachment]:
     """Pack one connection into MIME parts:
        - <name>.conf if the protocol uses an INI-style WireGuard config
+         (regular file attachment — user downloads/imports)
        - PNG QR encoding either the vpn:// link (AmneziaWG, where the link is
-         scannable by the official client) or the raw config/URL otherwise."""
+         scannable by the official client) or the raw config/URL otherwise.
+         Marked inline so it renders right next to its name in the HTML body."""
     attachments: List[EmailAttachment] = []
     conn = payload['connection']
     protocol = payload['protocol']
@@ -2638,11 +2647,107 @@ def _build_email_attachments_for_connection(payload: dict) -> List[EmailAttachme
                 filename=f"{safe_name}.png",
                 content=png,
                 mime_main='image', mime_sub='png',
+                inline=True,
+                content_id=_qr_cid_for_connection(conn),
             ))
         except Exception:
             logger.exception("Failed to render QR PNG for connection %s", conn.get('id'))
 
     return attachments
+
+
+def _build_email_body_html(panel_user: dict, payloads: List[dict], custom_message: str) -> str:
+    """HTML body with one card per connection, each containing the connection
+    name, server, protocol, copyable link, and an inline QR (≤ ~5×5 cm).
+
+    QR images are referenced by cid:<id> — those parts are added as inline
+    related resources in `_build_email_attachments_for_connection`."""
+    import html as _html
+
+    def esc(s):
+        return _html.escape(str(s or ''))
+
+    greeting = esc(panel_user.get('username') or 'there')
+    parts: List[str] = []
+    parts.append(
+        '<!doctype html><html><body style="margin:0; padding:16px; '
+        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif; '
+        'color:#222; background:#fafafa;">'
+    )
+    parts.append(f'<div style="max-width:620px; margin:0 auto;">')
+    parts.append(f'<p style="margin:0 0 12px;">Hi <b>{greeting}</b>,</p>')
+    if custom_message:
+        # User-provided free text — keep newlines, escape HTML.
+        msg_html = esc(custom_message).replace('\n', '<br>')
+        parts.append(
+            f'<div style="background:#fff; border:1px solid #e5e5e5; border-radius:8px; '
+            f'padding:12px; margin:0 0 16px; white-space:normal;">{msg_html}</div>'
+        )
+    parts.append(
+        f'<p style="margin:0 0 12px; color:#444;">You have '
+        f'<b>{len(payloads)}</b> VPN configuration(s):</p>'
+    )
+
+    for p in payloads:
+        conn = p['connection']
+        server = p['server']
+        proto = p['protocol']
+        proto_label = {
+            'awg': 'AmneziaWG', 'awg2': 'AmneziaWG 2.0', 'awg_legacy': 'AmneziaWG Legacy',
+            'wireguard': 'WireGuard', 'xray': 'Xray', 'telemt': 'Telemt (Telegram)',
+        }.get(proto, proto)
+        server_label = server.get('name') or server.get('host') or '?'
+        link_block = ''
+        if proto in ('xray', 'telemt'):
+            if p['config']:
+                link_block = (
+                    f'<div style="margin:8px 0 4px; font-size:12px; color:#666;">Link:</div>'
+                    f'<div style="font-family:Menlo,Consolas,monospace; word-break:break-all; '
+                    f'background:#f5f5f5; padding:8px; border-radius:4px; font-size:11px;">'
+                    f'{esc(p["config"])}</div>'
+                )
+        else:
+            if p['vpn_link']:
+                link_block = (
+                    f'<div style="margin:8px 0 4px; font-size:12px; color:#666;">VPN deep-link '
+                    f'(tap to import on mobile):</div>'
+                    f'<div style="font-family:Menlo,Consolas,monospace; word-break:break-all; '
+                    f'background:#f5f5f5; padding:8px; border-radius:4px; font-size:11px;">'
+                    f'<a href="{esc(p["vpn_link"])}" style="color:#333; text-decoration:none;">'
+                    f'{esc(p["vpn_link"])}</a></div>'
+                )
+
+        cid = _qr_cid_for_connection(conn)
+        parts.append(
+            '<div style="background:#fff; border:1px solid #e5e5e5; border-radius:10px; '
+            'padding:14px 16px; margin:0 0 14px;">'
+            f'  <div style="font-size:16px; font-weight:600; margin:0 0 4px;">{esc(conn.get("name") or "connection")}</div>'
+            f'  <div style="font-size:12px; color:#777; margin:0 0 8px;">'
+            f'    {esc(server_label)} &middot; {esc(proto_label)}'
+            f'  </div>'
+            f'  {link_block}'
+            # QR pinned to 180×180 px (~4.7 cm at 96dpi, fits the ≤5 cm target).
+            f'  <div style="text-align:center; margin:12px 0 4px;">'
+            f'    <img src="cid:{esc(cid)}" alt="QR for {esc(conn.get("name") or "config")}" '
+            f'         width="180" height="180" '
+            f'         style="width:180px; height:180px; max-width:5cm; max-height:5cm; '
+            f'                display:inline-block; border:1px solid #eee; border-radius:4px;">'
+            f'  </div>'
+            f'  <div style="text-align:center; font-size:11px; color:#999;">'
+            f'    Scan in your VPN app'
+            f'  </div>'
+            '</div>'
+        )
+
+    parts.append(
+        '<p style="margin:16px 0 4px; color:#666; font-size:12px;">'
+        '.conf files (if applicable) are attached separately — import them directly into '
+        'the VPN client if scanning is inconvenient.'
+        '</p>'
+        '<p style="margin:4px 0 0; color:#999; font-size:11px;">— Amnezia Web Panel</p>'
+    )
+    parts.append('</div></body></html>')
+    return ''.join(parts)
 
 
 def _build_email_body(panel_user: dict, payloads: List[dict], custom_message: str) -> str:
@@ -2730,9 +2835,11 @@ async def api_send_user_email(request: Request, user_id: str, req: SendUserEmail
         attachments.extend(_build_email_attachments_for_connection(p))
 
     subject = (req.subject or '').strip() or 'Your VPN configuration'
-    body = _build_email_body(panel_user, payloads, (req.message or '').strip())
+    custom = (req.message or '').strip()
+    body = _build_email_body(panel_user, payloads, custom)
+    html_body = _build_email_body_html(panel_user, payloads, custom)
 
-    ok, msg = await smtp_send_email(smtp, to_email, subject, body, attachments)
+    ok, msg = await smtp_send_email(smtp, to_email, subject, body, attachments, html_body=html_body)
     if not ok:
         return JSONResponse({'error': f'SMTP failed: {msg}', 'partial_failures': failures}, status_code=502)
 

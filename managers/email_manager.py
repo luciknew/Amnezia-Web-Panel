@@ -26,6 +26,11 @@ class EmailAttachment:
     # MIME type as "main/sub", e.g. ("application", "octet-stream") or ("image", "png").
     mime_main: str = "application"
     mime_sub: str = "octet-stream"
+    # When True, this part is added INTO the HTML alternative as a related
+    # resource so an <img src="cid:..."> tag in the HTML body renders it
+    # in place. Requires `content_id` to be set.
+    inline: bool = False
+    content_id: Optional[str] = None
 
 
 @dataclass
@@ -63,7 +68,15 @@ def _build_message(
     subject: str,
     body: str,
     attachments: List[EmailAttachment],
+    html_body: Optional[str] = None,
 ) -> EmailMessage:
+    """Build a MIME message. Structure depends on inputs:
+
+      • plain only, no inline images → text/plain (+ mixed attachments if any)
+      • plain + html, no inline images → multipart/alternative
+      • plain + html + inline images → multipart/alternative where the html
+        alternative is itself multipart/related (cid-referenced images live
+        inside). Regular attachments still ride at the top-level mixed."""
     msg = EmailMessage()
     from_header = (
         f"{settings.from_name} <{settings.from_email}>"
@@ -75,7 +88,33 @@ def _build_message(
     msg["Subject"] = subject or "Your VPN configuration"
     msg.set_content(body or "")
 
+    if html_body is not None:
+        msg.add_alternative(html_body, subtype="html")
+        # After add_alternative, msg becomes multipart/alternative with two
+        # children: [0] text/plain, [1] text/html. Inline images attach to [1].
+        html_part = msg.get_payload()[1]
+        for att in attachments:
+            if att.inline and att.content_id:
+                # Python's email package writes the Content-ID header value
+                # verbatim — without auto-wrapping it in angle brackets. RFC
+                # 2045 requires Content-ID to be a msg-id (i.e. <token>), and
+                # strict mail servers reject the bare form. Wrap explicitly.
+                cid_value = att.content_id
+                if not cid_value.startswith("<"):
+                    cid_value = f"<{cid_value}>"
+                html_part.add_related(
+                    att.content,
+                    maintype=att.mime_main,
+                    subtype=att.mime_sub,
+                    cid=cid_value,
+                    filename=att.filename,
+                )
+
+    # Non-inline attachments (or all of them when html_body is None) ride at
+    # the top level — Python promotes the message to multipart/mixed as needed.
     for att in attachments:
+        if att.inline and html_body is not None:
+            continue  # already added to the html alternative
         msg.add_attachment(
             att.content,
             maintype=att.mime_main,
@@ -91,15 +130,20 @@ async def send_email(
     subject: str,
     body: str,
     attachments: Optional[List[EmailAttachment]] = None,
+    html_body: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Send one email asynchronously. Returns (ok, message). Never raises —
-    the caller surfaces the message back to the admin via the API response."""
+    the caller surfaces the message back to the admin via the API response.
+
+    When html_body is provided, the message is built as multipart/alternative
+    with text+html, and any attachment with inline=True+content_id is embedded
+    as a cid-referenced image inside the html alternative."""
     if not settings.is_configured():
         return False, "SMTP is not configured (open Settings → Email)"
     if not to_email:
         return False, "Recipient email is empty"
 
-    msg = _build_message(settings, to_email, subject, body, attachments or [])
+    msg = _build_message(settings, to_email, subject, body, attachments or [], html_body=html_body)
 
     use_ssl = settings.encryption == "ssl"
     start_tls = settings.encryption == "starttls"

@@ -1190,13 +1190,19 @@ def _scrape_server_traffic(server, sid, my_conns):
 
 COUNTRY_REFRESH_INTERVAL_SEC = 3600  # 1 hour
 
+# Bumped whenever the country-detection algorithm itself changes (e.g.
+# switching from inbound DNS-resolve to SSH+egress).  Servers with an
+# older version stamp get re-detected on the next loop tick regardless
+# of cache age — so admins don't have to wait for the cache to expire to
+# benefit from a logic fix.
+COUNTRY_DETECTION_VERSION = 2
 
-async def _lookup_country(host: str):
-    """Returns (country_code, country_name) for the given host, or None on
-    failure (private IP, network error, hostname doesn't resolve, etc.).
-    Never raises — country info is decorative; a missing one shouldn't
-    cause the background loop to abort."""
-    if not host:
+
+async def _lookup_country_by_ip(ip: str):
+    """Returns (country_code, country_name) for the given IP, or None on
+    failure (private range, network error, etc.). Never raises — country
+    info is decorative; a missing one shouldn't crash the loop."""
+    if not ip:
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1204,18 +1210,16 @@ async def _lookup_country(host: str):
             # cost predictable.  `status` tells us success/fail without
             # having to guess from missing keys.
             r = await client.get(
-                f"http://ip-api.com/json/{host}",
+                f"http://ip-api.com/json/{ip}",
                 params={"fields": "status,countryCode,country,message"},
             )
             if r.status_code != 200:
                 return None
             data = r.json()
             if data.get("status") != "success":
-                # Most common reasons: "private range", "reserved range",
-                # "invalid query". All cosmetic-failure cases — just log.
                 logger.debug(
                     "country lookup for %s failed: %s",
-                    host, data.get("message") or data,
+                    ip, data.get("message") or data,
                 )
                 return None
             code = (data.get("countryCode") or "").strip().upper()
@@ -1224,19 +1228,89 @@ async def _lookup_country(host: str):
                 return None
             return code, name
     except Exception as e:
-        logger.debug("country lookup for %s raised %s", host, e)
+        logger.debug("country lookup for %s raised %s", ip, e)
         return None
+
+
+# Endpoints we ask the server to call to discover its own outbound IP.
+# We try them in order so a single blocked / slow service can be skipped.
+_EGRESS_IP_PROBES = (
+    "curl -s --max-time 5 https://api.ipify.org",
+    "curl -s --max-time 5 https://ifconfig.me",
+    "curl -s --max-time 5 https://icanhazip.com",
+    "curl -s --max-time 5 https://ipv4.icanhazip.com",
+)
+
+
+def _looks_like_public_ip(s: str) -> bool:
+    """Cheap sanity filter on what curl returned — avoid feeding HTML error
+    pages or empty strings to ip-api."""
+    if not s or len(s) > 45 or ' ' in s or '<' in s:
+        return False
+    # Plausible IPv4 (a.b.c.d) or IPv6 (contains ':').
+    parts = s.split('.')
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return True
+    if ':' in s and all(c in '0123456789abcdefABCDEF:' for c in s):
+        return True
+    return False
+
+
+async def _resolve_server_country(srv: dict):
+    """Discover the SERVER's outbound public IP via SSH, then geolocate it.
+
+    Why SSH+egress rather than DNS-resolve the panel-known hostname:
+    the hostname admins enter (host / client_host) is the *inbound* address
+    — where clients dial in.  When the box sits behind a Mikrotik that
+    tunnels egress through another country (or behind a VPN, or any NAT
+    with non-trivial routing), the inbound IP can belong to a totally
+    different country than where the server's traffic actually exits the
+    internet.  For a VPN admin panel, what matters is the egress country
+    (that's what end-users will appear to browse from), not the inbound
+    one.  So we ask the server itself."""
+    def _ssh_get_egress_ip():
+        try:
+            ssh = get_ssh(srv)
+        except Exception:
+            return None
+        try:
+            ssh.connect()
+            for cmd in _EGRESS_IP_PROBES:
+                try:
+                    out, _, code = ssh.run_command(cmd)
+                except Exception:
+                    continue
+                ip = (out or "").strip().splitlines()[0].strip() if out else ""
+                if code == 0 and _looks_like_public_ip(ip):
+                    return ip
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+
+    egress_ip = await asyncio.to_thread(_ssh_get_egress_ip)
+    if not egress_ip:
+        return None
+    return await _lookup_country_by_ip(egress_ip)
 
 
 async def _refresh_stale_server_countries():
     """Walk all servers, refresh `country_*` fields for those whose cache is
-    missing or older than COUNTRY_REFRESH_INTERVAL_SEC.  We use the client-
-    facing host (the public address) — the SSH host can be an internal IP
-    like 10.x that ip-api would refuse to geolocate."""
+    missing or older than COUNTRY_REFRESH_INTERVAL_SEC.  Detection is done
+    SSH→curl→ip-api so we report the server's *egress* country, not the
+    DNS-resolved inbound address (see _resolve_server_country docstring)."""
     data = load_data()
     now = datetime.now()
     stale_indexes: list[int] = []
     for idx, srv in enumerate(data.get("servers", [])):
+        # Algorithm-version mismatch → always re-check, even on fresh cache.
+        if srv.get("country_detection_version") != COUNTRY_DETECTION_VERSION:
+            stale_indexes.append(idx)
+            continue
         checked_iso = srv.get("country_checked_at")
         if checked_iso:
             try:
@@ -1250,12 +1324,11 @@ async def _refresh_stale_server_countries():
     if not stale_indexes:
         return
 
-    # Resolve concurrently — ip-api responses are ~50ms each, so doing 4-10
-    # in parallel makes the loop snappier without any rate-limit risk.
+    # Each lookup involves one SSH command + one ip-api call. Run them in
+    # parallel — N servers finish in roughly the time of the slowest one.
     async def _resolve_one(idx):
         srv = data["servers"][idx]
-        host = (srv.get("client_host") or srv.get("host") or "").strip()
-        result = await _lookup_country(host)
+        result = await _resolve_server_country(srv)
         return idx, result
 
     results = await asyncio.gather(*[_resolve_one(i) for i in stale_indexes])
@@ -1268,12 +1341,15 @@ async def _refresh_stale_server_countries():
                 continue
             srv = servers[idx]
             srv["country_checked_at"] = now.isoformat()
+            srv["country_detection_version"] = COUNTRY_DETECTION_VERSION
             if result:
                 srv["country_code"], srv["country_name"] = result
             else:
                 # Preserve the previous reading if we had one, but record
                 # that we tried — prevents tight retry loops on a host that
-                # just doesn't resolve.
+                # just doesn't resolve.  Note: on schema-version bumps, we
+                # still REPLACE the version stamp above, so the next refresh
+                # won't keep re-trying on every loop tick.
                 srv.setdefault("country_code", "")
                 srv.setdefault("country_name", "")
         save_data(curr)

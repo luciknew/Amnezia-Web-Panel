@@ -83,6 +83,24 @@ app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', se
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
+
+def _country_flag(code: str) -> str:
+    """ISO 3166-1 alpha-2 country code → flag emoji (e.g. 'DE' → '🇩🇪').
+    Returns '' for anything that doesn't look like a 2-letter code, so the
+    template can safely render `{{ country_code | country_flag }}` even on
+    servers where geo-lookup failed."""
+    if not code or len(code) != 2:
+        return ''
+    code = code.upper()
+    if not (code[0].isalpha() and code[1].isalpha()):
+        return ''
+    # Regional Indicator Symbol Letters live at U+1F1E6 ('A') onwards.
+    return chr(0x1F1E6 + ord(code[0]) - ord('A')) + \
+           chr(0x1F1E6 + ord(code[1]) - ord('A'))
+
+
+templates.env.filters['country_flag'] = _country_flag
+
 if getattr(sys, 'frozen', False):
     application_path = os.path.dirname(sys.executable)
 else:
@@ -827,6 +845,7 @@ class AddServerRequest(BaseModel):
     password: str = ''
     private_key: str = ''
     name: str = ''
+    description: str = ''
 
 
 class EditServerRequest(BaseModel):
@@ -841,6 +860,8 @@ class EditServerRequest(BaseModel):
     # fields can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    # None = keep current, otherwise overwrite (empty string clears it).
+    description: Optional[str] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1158,12 +1179,124 @@ def _scrape_server_traffic(server, sid, my_conns):
     return server_updates
 
 
+# ============================================================================
+# Server-country detection
+# ============================================================================
+# Each server card displays its hosting country (flag + code).  We resolve it
+# by hitting ip-api.com — free, no API key, accepts both IPs and hostnames,
+# 45 req/min limit (we're miles under that).  Results are cached in the
+# server dict (`country_code`, `country_name`, `country_checked_at`) and
+# refreshed lazily once per hour from the periodic background loop.
+
+COUNTRY_REFRESH_INTERVAL_SEC = 3600  # 1 hour
+
+
+async def _lookup_country(host: str):
+    """Returns (country_code, country_name) for the given host, or None on
+    failure (private IP, network error, hostname doesn't resolve, etc.).
+    Never raises — country info is decorative; a missing one shouldn't
+    cause the background loop to abort."""
+    if not host:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # `fields=...` keeps the response small and ip-api's per-query
+            # cost predictable.  `status` tells us success/fail without
+            # having to guess from missing keys.
+            r = await client.get(
+                f"http://ip-api.com/json/{host}",
+                params={"fields": "status,countryCode,country,message"},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if data.get("status") != "success":
+                # Most common reasons: "private range", "reserved range",
+                # "invalid query". All cosmetic-failure cases — just log.
+                logger.debug(
+                    "country lookup for %s failed: %s",
+                    host, data.get("message") or data,
+                )
+                return None
+            code = (data.get("countryCode") or "").strip().upper()
+            name = (data.get("country") or "").strip()
+            if not code:
+                return None
+            return code, name
+    except Exception as e:
+        logger.debug("country lookup for %s raised %s", host, e)
+        return None
+
+
+async def _refresh_stale_server_countries():
+    """Walk all servers, refresh `country_*` fields for those whose cache is
+    missing or older than COUNTRY_REFRESH_INTERVAL_SEC.  We use the client-
+    facing host (the public address) — the SSH host can be an internal IP
+    like 10.x that ip-api would refuse to geolocate."""
+    data = load_data()
+    now = datetime.now()
+    stale_indexes: list[int] = []
+    for idx, srv in enumerate(data.get("servers", [])):
+        checked_iso = srv.get("country_checked_at")
+        if checked_iso:
+            try:
+                last = datetime.fromisoformat(checked_iso)
+                if (now - last).total_seconds() < COUNTRY_REFRESH_INTERVAL_SEC:
+                    continue
+            except Exception:
+                pass  # malformed timestamp → treat as stale
+        stale_indexes.append(idx)
+
+    if not stale_indexes:
+        return
+
+    # Resolve concurrently — ip-api responses are ~50ms each, so doing 4-10
+    # in parallel makes the loop snappier without any rate-limit risk.
+    async def _resolve_one(idx):
+        srv = data["servers"][idx]
+        host = (srv.get("client_host") or srv.get("host") or "").strip()
+        result = await _lookup_country(host)
+        return idx, result
+
+    results = await asyncio.gather(*[_resolve_one(i) for i in stale_indexes])
+
+    async with DATA_LOCK:
+        curr = load_data()
+        servers = curr.get("servers", [])
+        for idx, result in results:
+            if idx >= len(servers):
+                continue
+            srv = servers[idx]
+            srv["country_checked_at"] = now.isoformat()
+            if result:
+                srv["country_code"], srv["country_name"] = result
+            else:
+                # Preserve the previous reading if we had one, but record
+                # that we tried — prevents tight retry loops on a host that
+                # just doesn't resolve.
+                srv.setdefault("country_code", "")
+                srv.setdefault("country_name", "")
+        save_data(curr)
+    logger.info(
+        "country sync refreshed %d server(s); known countries: %s",
+        len(stale_indexes),
+        [s.get("country_code") or "?" for s in servers],
+    )
+
+
 async def periodic_background_tasks():
     """Background task to sync traffic limits and Remnawave every 10 minutes"""
     while True:
         try:
             # We wait before the first sync to let the app settle
-            await asyncio.sleep(60) 
+            await asyncio.sleep(60)
+
+            # --- 0. SERVER COUNTRIES (cheap, runs every loop but only hits
+            # the network for entries whose cache is >1h old) ---
+            try:
+                await _refresh_stale_server_countries()
+            except Exception:
+                logger.exception("country sync failed (non-fatal)")
             
             # --- 1. TRAFFIC SYNC & LIMITS ---
             logger.info("Starting background traffic sync...")
@@ -1445,6 +1578,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
         server = {
             'name': name, 'host': host,
             'client_host': (req.client_host or '').strip(),
+            'description': (req.description or '').strip(),
             'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
@@ -1504,6 +1638,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         # None = keep current, otherwise overwrite (empty string clears it).
         if req.client_host is not None:
             server['client_host'] = req.client_host.strip()
+        if req.description is not None:
+            server['description'] = req.description.strip()
         server['ssh_port'] = new_port
         server['username'] = new_user
         server['password'] = new_pass

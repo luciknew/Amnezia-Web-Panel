@@ -19,6 +19,7 @@
             data-name="{{ server.name }}" data-host="{{ server.host }}"
             data-client-host="{{ server.client_host or '' }}" data-port="{{ server.ssh_port }}"
             data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
+            data-description="{{ server.description or '' }}"
             draggable="true">
             <div class="server-meta">
                 <div class="server-icon">🖥</div>
@@ -27,9 +28,21 @@
                         <span class="ping-dot ping-pending" id="ping-{{ loop.index0 }}"
                             title="{{ _('ping_checking') }}"></span>
                         <span>{{ server.name }}</span>
+                        {% if server.country_code %}
+                        <span class="server-country" title="{{ server.country_name or server.country_code }}"
+                              style="font-size:0.85rem; margin-left:6px;">
+                            {{ server.country_code | country_flag }} {{ server.country_code }}
+                        </span>
+                        {% endif %}
                         <span class="ping-ms text-muted" id="ping-ms-{{ loop.index0 }}"></span>
                     </div>
                     <div class="server-host">{{ server.host }}:{{ server.ssh_port }}</div>
+                    {% if server.description %}
+                    <div class="server-description text-muted"
+                         style="margin-top:4px; font-size:0.8rem; line-height:1.3; word-wrap:break-word; white-space:pre-line;">
+                        {{ server.description }}
+                    </div>
+                    {% endif %}
                 </div>
             </div>
 
@@ -96,6 +109,12 @@
             <div class="form-group">
                 <label class="form-label">{{ _('name') }}</label>
                 <input class="form-input" type="text" id="editServerName">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('server_description') }}</label>
+                <textarea class="form-textarea" id="editServerDescription" rows="2"
+                          placeholder="{{ _('server_description_placeholder') }}"></textarea>
             </div>
 
             <div class="form-row">
@@ -167,6 +186,12 @@
             <div class="form-group">
                 <label class="form-label">{{ _('name') }}</label>
                 <input class="form-input" type="text" id="serverName" placeholder="My VPN Server">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('server_description') }}</label>
+                <textarea class="form-textarea" id="serverDescription" rows="2"
+                          placeholder="{{ _('server_description_placeholder') }}"></textarea>
             </div>
 
             <div class="form-row">
@@ -251,6 +276,7 @@
         try {
             const data = {
                 name: document.getElementById('serverName').value,
+                description: document.getElementById('serverDescription').value,
                 host: document.getElementById('serverHost').value,
                 client_host: document.getElementById('serverClientHost').value,
                 ssh_port: parseInt(document.getElementById('serverPort').value) || 22,
@@ -300,6 +326,7 @@
         if (!card) return;
         document.getElementById('editServerIdx').value = card.dataset.idx;
         document.getElementById('editServerName').value = card.dataset.name || '';
+        document.getElementById('editServerDescription').value = card.dataset.description || '';
         document.getElementById('editServerHost').value = card.dataset.host || '';
         document.getElementById('editServerClientHost').value = card.dataset.clientHost || '';
         document.getElementById('editServerPort').value = card.dataset.port || '22';
@@ -329,6 +356,7 @@
         try {
             const body = {
                 name: document.getElementById('editServerName').value,
+                description: document.getElementById('editServerDescription').value,
                 host: document.getElementById('editServerHost').value,
                 client_host: document.getElementById('editServerClientHost').value,
                 ssh_port: parseInt(document.getElementById('editServerPort').value) || 22,

@@ -41,6 +41,8 @@
     "ssh_host": "SSH 主机 / IP",
     "client_host": "客户端主机 / IP（用于 VPN 配置）",
     "client_host_hint": "写入客户端 VPN 配置的地址。留空则使用 SSH 主机。当服务器位于 NAT 之后且客户端通过其他地址连接时，请单独设置。",
+    "server_description": "描述",
+    "server_description_placeholder": "自由备注 —— 区域、托管商、续费日期，任何你想记住的内容",
     "ssh_port": "SSH 端口",
     "ssh_user": "用户名",
     "ssh_password": "密码",

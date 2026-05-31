@@ -41,6 +41,8 @@
     "ssh_host": "Hôte SSH / IP",
     "client_host": "Hôte / IP client (pour les configs VPN)",
     "client_host_hint": "Adresse utilisée dans les configs VPN clientes. Laissez vide pour utiliser l'hôte SSH. Définissez une autre valeur si le serveur est derrière un NAT et que les clients se connectent via une autre adresse.",
+    "server_description": "Description",
+    "server_description_placeholder": "Notes libres — région, hébergeur, renouvellement de facturation, tout ce dont vous voulez vous souvenir",
     "ssh_port": "Port SSH",
     "ssh_user": "Utilisateur",
     "ssh_password": "Mot de passe",

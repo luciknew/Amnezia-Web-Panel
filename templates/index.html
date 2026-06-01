@@ -50,8 +50,15 @@
             <div class="server-protocols" id="server-protocols-{{ loop.index0 }}">
                 {% if server.allow_vovka %}
                 <span class="badge badge-info" title="{{ _('allow_vovka_label') }}"
-                      style="background:#e3f2fd; color:#0d47a1;">
-                    🤖 {{ _('allow_vovka_short') }}
+                      style="background:#e3f2fd; color:#0d47a1; display:inline-flex; align-items:center; gap:4px;">
+                    {# Static avatar served from /static/img/vovka.png — drop a
+                       small PNG/SVG of Vovka there. onerror falls back to an
+                       emoji so the badge keeps making sense if the file is
+                       missing for any reason. #}
+                    <img src="/static/img/vovka.png" alt="Vovka"
+                         style="width:20px; height:20px; border-radius:50%; object-fit:cover;"
+                         onerror="this.replaceWith(Object.assign(document.createElement('span'),{textContent:'🤖'}));">
+                    {{ _('allow_vovka_short') }}
                 </span>
                 {% endif %}
                 {% if server.protocols %}

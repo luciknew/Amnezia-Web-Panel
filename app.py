@@ -52,6 +52,7 @@ OPENAPI_TAGS = [
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
+    {"name": "External", "description": "Endpoints for external bots / scripts. Same Bearer-token auth as the rest of the API, but the output is filtered to whatever the admin has explicitly flagged as allowed for external access (per-server `allow_vovka`)."},
 ]
 
 app = FastAPI(
@@ -846,6 +847,9 @@ class AddServerRequest(BaseModel):
     private_key: str = ''
     name: str = ''
     description: str = ''
+    # External-bot gate: when True, the server shows up in /api/external/servers
+    # for any caller authenticated with a Bearer token.
+    allow_vovka: bool = False
 
 
 class EditServerRequest(BaseModel):
@@ -862,6 +866,8 @@ class EditServerRequest(BaseModel):
     private_key: Optional[str] = None
     # None = keep current, otherwise overwrite (empty string clears it).
     description: Optional[str] = None
+    # None = keep current, True/False = set explicitly.
+    allow_vovka: Optional[bool] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1655,6 +1661,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
             'name': name, 'host': host,
             'client_host': (req.client_host or '').strip(),
             'description': (req.description or '').strip(),
+            'allow_vovka': bool(req.allow_vovka),
             'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
@@ -1716,6 +1723,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
             server['client_host'] = req.client_host.strip()
         if req.description is not None:
             server['description'] = req.description.strip()
+        if req.allow_vovka is not None:
+            server['allow_vovka'] = bool(req.allow_vovka)
         server['ssh_port'] = new_port
         server['username'] = new_user
         server['password'] = new_pass
@@ -1726,6 +1735,47 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
     except Exception as e:
         logger.exception("Error editing server")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/external/servers', tags=["External"])
+async def api_external_servers(request: Request):
+    """Server list filtered for external bots.
+
+    Only servers with `allow_vovka = True` are returned, and the response
+    deliberately omits SSH credentials and any other field a third-party
+    bot has no business knowing. Use a Bearer API token (Settings → API
+    Tokens in the admin UI) — admin-equivalent rights, same auth path as
+    every other privileged endpoint, just narrower output.
+
+    Returns `id` (the panel's stable integer index — use it when calling
+    any other /api/servers/{server_id}/... endpoint), display info, the
+    set of installed VPN protocols, and the cached country flag/code if
+    geo-detection has run."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    data = load_data()
+    out = []
+    for idx, srv in enumerate(data.get('servers', []) or []):
+        if not srv.get('allow_vovka'):
+            continue
+        # Only protocols actually deployed — saves the caller from filtering
+        # later and avoids leaking which extras were tried-and-removed.
+        installed = [
+            p for p, info in (srv.get('protocols') or {}).items()
+            if isinstance(info, dict) and info.get('installed')
+        ]
+        out.append({
+            'id': idx,
+            'name': srv.get('name') or srv.get('host') or '',
+            'host': srv.get('host') or '',
+            'client_host': srv.get('client_host') or '',
+            'description': srv.get('description') or '',
+            'country_code': srv.get('country_code') or '',
+            'country_name': srv.get('country_name') or '',
+            'protocols': installed,
+        })
+    return {'servers': out}
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])

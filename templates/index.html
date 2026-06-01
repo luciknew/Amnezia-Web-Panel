@@ -20,6 +20,7 @@
             data-client-host="{{ server.client_host or '' }}" data-port="{{ server.ssh_port }}"
             data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
             data-description="{{ server.description or '' }}"
+            data-allow-vovka="{{ '1' if server.allow_vovka else '0' }}"
             draggable="true">
             <div class="server-meta">
                 <div class="server-icon">🖥</div>
@@ -47,6 +48,12 @@
             </div>
 
             <div class="server-protocols" id="server-protocols-{{ loop.index0 }}">
+                {% if server.allow_vovka %}
+                <span class="badge badge-info" title="{{ _('allow_vovka_label') }}"
+                      style="background:#e3f2fd; color:#0d47a1;">
+                    🤖 {{ _('allow_vovka_short') }}
+                </span>
+                {% endif %}
                 {% if server.protocols %}
                 {% for proto_key, proto_val in server.protocols.items() %}
                 {% if proto_val.get('installed') %}
@@ -115,6 +122,14 @@
                 <label class="form-label">{{ _('server_description') }}</label>
                 <textarea class="form-textarea" id="editServerDescription" rows="2"
                           placeholder="{{ _('server_description_placeholder') }}"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;">
+                    <input type="checkbox" id="editServerAllowVovka">
+                    <span>{{ _('allow_vovka_label') }}</span>
+                </label>
+                <div class="form-hint">{{ _('allow_vovka_hint') }}</div>
             </div>
 
             <div class="form-row">
@@ -192,6 +207,14 @@
                 <label class="form-label">{{ _('server_description') }}</label>
                 <textarea class="form-textarea" id="serverDescription" rows="2"
                           placeholder="{{ _('server_description_placeholder') }}"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;">
+                    <input type="checkbox" id="serverAllowVovka">
+                    <span>{{ _('allow_vovka_label') }}</span>
+                </label>
+                <div class="form-hint">{{ _('allow_vovka_hint') }}</div>
             </div>
 
             <div class="form-row">
@@ -277,6 +300,7 @@
             const data = {
                 name: document.getElementById('serverName').value,
                 description: document.getElementById('serverDescription').value,
+                allow_vovka: document.getElementById('serverAllowVovka').checked,
                 host: document.getElementById('serverHost').value,
                 client_host: document.getElementById('serverClientHost').value,
                 ssh_port: parseInt(document.getElementById('serverPort').value) || 22,
@@ -327,6 +351,7 @@
         document.getElementById('editServerIdx').value = card.dataset.idx;
         document.getElementById('editServerName').value = card.dataset.name || '';
         document.getElementById('editServerDescription').value = card.dataset.description || '';
+        document.getElementById('editServerAllowVovka').checked = card.dataset.allowVovka === '1';
         document.getElementById('editServerHost').value = card.dataset.host || '';
         document.getElementById('editServerClientHost').value = card.dataset.clientHost || '';
         document.getElementById('editServerPort').value = card.dataset.port || '22';
@@ -357,6 +382,7 @@
             const body = {
                 name: document.getElementById('editServerName').value,
                 description: document.getElementById('editServerDescription').value,
+                allow_vovka: document.getElementById('editServerAllowVovka').checked,
                 host: document.getElementById('editServerHost').value,
                 client_host: document.getElementById('editServerClientHost').value,
                 ssh_port: parseInt(document.getElementById('editServerPort').value) || 22,

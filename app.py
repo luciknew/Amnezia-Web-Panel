@@ -2591,8 +2591,10 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
 
 @app.post('/api/users/add', tags=["Users"])
 async def api_add_user(request: Request, req: AddUserRequest):
-    cur = get_current_user(request)
-    if not cur or cur['role'] != 'admin':
+    # Принимаем session admin/support либо Bearer-токен (внешний бот, e.g. Вовка).
+    # Согласовано с соседними /api/users/{user_id}/{update,delete,toggle} —
+    # везде через _check_admin (admin/support). Bearer admin-equivalent по дизайну.
+    if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
@@ -2822,12 +2824,15 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
 async def api_get_user_connections(request: Request, user_id: str):
+    # Self-service путь: session-user типа 'user' видит только свои.
     user = get_current_user(request)
-    if not user:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    # Users can only see their own, admin/support can see all
-    if user['role'] == 'user' and user['id'] != user_id:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if user and user['role'] == 'user':
+        if user['id'] != user_id:
+            return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    else:
+        # Admin/support session или Bearer-токен (внешний бот) — доступ к любым.
+        if not _check_admin(request):
+            return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
     for c in conns:

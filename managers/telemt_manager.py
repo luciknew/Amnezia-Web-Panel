@@ -342,7 +342,15 @@ docker compose version
         return users
 
     def add_client(self, protocol_type, name, host='', port='', **kwargs):
-        username = re.sub(r'[^a-zA-Z0-9_.-]', '', name.replace(' ', '_'))
+        # TOML "bare keys" only allow [A-Za-z0-9_-]; a literal dot is the
+        # nested-table separator, so `foo.bar = "x"` parses as the table
+        # `[foo]` with member `bar`, not as a scalar with the dotted name.
+        # The previous regex kept dots in usernames, which produced a config
+        # like `Karavan_kapranova.e_vpn = "..."` and crashed Telemt at startup
+        # with "expected a string, got map".  Replace anything outside the
+        # safe set with underscores (vs stripping) so we don't produce empty
+        # keys for usernames that were all-non-ASCII either.
+        username = re.sub(r'[^A-Za-z0-9_-]+', '_', name.replace(' ', '_')).strip('_')
         if not username: username = "user_" + uuid.uuid4().hex[:8]
         
         config_text = self._get_server_config()

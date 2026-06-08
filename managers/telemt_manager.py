@@ -169,8 +169,22 @@ docker compose version
             
         config_content = re.sub(r'public_port\s*=\s*\d+', f'public_port = {port}', config_content)
         
-        # Remove default hello user
-        config_content = re.sub(r'^hello\s*=\s*".*?"', '', config_content, flags=re.MULTILINE)
+        # Replace the bundled `hello = "00000000..."` placeholder with a
+        # service entry that has a fresh random secret.  Telemt refuses to
+        # start when `[access.users]` is empty ("No users configured"), so if
+        # we stripped the default outright the container would crash-loop
+        # until the first real add_client. Keeping a service-named placeholder
+        # with an unguessable secret lets the proxy come up immediately:
+        #   - admin can't (and shouldn't) hand out the `_telemt_init` link;
+        #   - admin sees it in the UI client list and can delete it manually
+        #     once a real user has been added.
+        _placeholder_secret = secrets.token_hex(16)
+        config_content = re.sub(
+            r'^hello\s*=\s*".*?"\s*$',
+            f'_telemt_init = "{_placeholder_secret}"',
+            config_content,
+            flags=re.MULTILINE,
+        )
             
         self.ssh.upload_file_sudo(config_content, f"{remote_dir}/config.toml")
         

@@ -17,6 +17,20 @@
             <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">🔍</span>
         </div>
 
+        {# Per-page size selector — placed next to search so admins see it
+           without scrolling to the bottom of the page. Mirrored to URL
+           (?size=...) and persisted across reloads via _writeStateToUrl. #}
+        <label style="color: var(--text-muted); font-size: 0.9rem; display:inline-flex; align-items:center; gap:6px; flex-shrink:0;">
+            {{ _('per_page_label') }}
+            <select id="pageSizeSelect" class="form-select" style="padding: 6px 28px 6px 10px; width: auto;"
+                    onchange="changePageSize(parseInt(this.value, 10))">
+                <option value="10">10</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+            </select>
+        </label>
+
         {% if current_user.role == 'admin' %}
         <button class="btn btn-primary" onclick="openModal('addUserModal')" style="flex-shrink: 0;">
             <span>＋</span> {{ _('add_user') }}
@@ -37,16 +51,6 @@
             <div id="pageNumbers" style="display:flex; align-items:center; gap:4px;"></div>
             <button class="btn btn-secondary btn-sm" id="nextPage" onclick="changePage(1)">{{ _('next_page') }}</button>
             <span id="pageInfo" style="margin-left: 8px; color: var(--text-muted); font-size: 0.85rem;"></span>
-            <label style="margin-left: 16px; color: var(--text-muted); font-size: 0.85rem; display:inline-flex; align-items:center; gap:6px;">
-                {{ _('per_page_label') }}
-                <select id="pageSizeSelect" class="form-select" style="padding: 4px 8px; width: auto;"
-                        onchange="changePageSize(parseInt(this.value, 10))">
-                    <option value="10">10</option>
-                    <option value="25">25</option>
-                    <option value="50">50</option>
-                    <option value="100">100</option>
-                </select>
-            </label>
         </div>
     </div>
 

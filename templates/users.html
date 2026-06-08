@@ -9,6 +9,8 @@
         <h1 class="section-title" style="margin-bottom:0; flex-shrink: 0;">
             <span class="icon">👥</span>
             {{ _('users_title') }}
+            <span id="usersTotalCount"
+                  style="font-size: 0.7em; color: var(--text-muted); font-weight: 500; margin-left: 6px;"></span>
         </h1>
 
         <div style="flex: 1; min-width: 250px; max-width: 500px; position: relative;">
@@ -524,6 +526,20 @@
 
         try {
             const data = await apiCall(`/api/users?search=${encodeURIComponent(searchQuery)}&page=${currentPage}&size=${pageSize}`);
+
+            // Total count next to the "Users" header — show as plain number,
+            // or "shown / total" when the admin has narrowed via search so
+            // they don't think users vanished.
+            const totalEl = document.getElementById('usersTotalCount');
+            if (totalEl) {
+                if (searchQuery) {
+                    totalEl.textContent = `(${data.total})`;
+                    totalEl.title = _('search_match_count_title') || '';
+                } else {
+                    totalEl.textContent = `(${data.total})`;
+                    totalEl.title = '';
+                }
+            }
 
             if (data.users.length === 0) {
                 loading.classList.add('hidden');

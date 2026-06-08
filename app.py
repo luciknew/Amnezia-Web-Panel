@@ -2547,13 +2547,19 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
     search = search.lower()
     for u in all_users:
         if search:
-            match = (search in u['username'].lower() or 
-                     (u.get('email') and search in u['email'].lower()) or 
+            match = (search in u['username'].lower() or
+                     (u.get('email') and search in u['email'].lower()) or
                      (u.get('telegramId') and search in str(u['telegramId']).lower()))
             if not match:
                 continue
         filtered.append(u)
-        
+
+    # Newest-first ordering: admins almost always want to see who they just
+    # added at the top.  Sorting by ISO created_at strings is correct because
+    # the format is lexicographically sortable; users that pre-date the field
+    # have empty strings and naturally end up at the bottom under reverse=True.
+    filtered.sort(key=lambda u: u.get('created_at') or '', reverse=True)
+
     total = len(filtered)
     start = (page - 1) * size
     end = start + size

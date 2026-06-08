@@ -133,6 +133,7 @@
     "prev_page": "← قبلی",
     "next_page": "بعدی →",
     "page_info": "صفحه {} از {}",
+    "per_page_label": "در هر صفحه:",
     "loading_users": "در حال بارگذاری کاربران...",
     "nothing_found": "چیزی یافت نشد",
     "search_empty_desc": "جستجوی دیگری را امتحان کنید یا کاربر جدید بسازید",

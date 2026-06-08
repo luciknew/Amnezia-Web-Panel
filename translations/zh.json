@@ -133,6 +133,7 @@
     "prev_page": "← 上一页",
     "next_page": "下一页 →",
     "page_info": "第 {} 页，共 {} 页",
+    "per_page_label": "每页：",
     "loading_users": "正在加载用户...",
     "nothing_found": "未找到匹配项",
     "search_empty_desc": "请尝试更改查询条件或创建新用户",

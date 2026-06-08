@@ -26,16 +26,27 @@
 
     <div id="usersContainer" class="hidden">
         <div class="clients-list" id="usersGrid"
-            style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
-            <!-- Users will be loaded here via JS -->
+             style="display: flex; flex-direction: column; gap: var(--space-sm);">
+            <!-- Users will be loaded here via JS — single column so each
+                 user is one row, easier to scan at high counts. -->
         </div>
 
         <div id="pagination"
-            style="display: flex; justify-content: center; align-items: center; gap: var(--space-md); margin-top: var(--space-xl);">
-            <button class="btn btn-secondary btn-sm" id="prevPage" onclick="changePage(-1)">{{ _('prev_page')
-                }}</button>
-            <span id="pageInfo" style="font-weight: 600; font-size: 0.9rem;"></span>
+            style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: var(--space-xl);">
+            <button class="btn btn-secondary btn-sm" id="prevPage" onclick="changePage(-1)">{{ _('prev_page') }}</button>
+            <div id="pageNumbers" style="display:flex; align-items:center; gap:4px;"></div>
             <button class="btn btn-secondary btn-sm" id="nextPage" onclick="changePage(1)">{{ _('next_page') }}</button>
+            <span id="pageInfo" style="margin-left: 8px; color: var(--text-muted); font-size: 0.85rem;"></span>
+            <label style="margin-left: 16px; color: var(--text-muted); font-size: 0.85rem; display:inline-flex; align-items:center; gap:6px;">
+                {{ _('per_page_label') }}
+                <select id="pageSizeSelect" class="form-select" style="padding: 4px 8px; width: auto;"
+                        onchange="changePageSize(parseInt(this.value, 10))">
+                    <option value="10">10</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                </select>
+            </label>
         </div>
     </div>
 
@@ -390,18 +401,111 @@
 
     const serversData = {{ servers | tojson }};
 
+    // Page state is mirrored to the URL query string so reload / browser
+    // back-forward / bookmarks all land on the same page the admin was
+    // looking at. We use ?page=N&q=... rather than the hash so server-side
+    // tools see it too if needed.
+    // Allowed page-size choices — keep in sync with the <select> options
+    // in the template, otherwise an unexpected `?size=` would silently fail.
+    const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+
+    function _readStateFromUrl() {
+        const url = new URL(location.href);
+        const p = parseInt(url.searchParams.get('page') || '1', 10);
+        if (Number.isFinite(p) && p >= 1) currentPage = p;
+        const q = url.searchParams.get('q') || '';
+        if (q) {
+            searchQuery = q;
+            const input = document.getElementById('userSearch');
+            if (input) input.value = q;
+        }
+        const s = parseInt(url.searchParams.get('size') || '', 10);
+        if (PAGE_SIZE_OPTIONS.includes(s)) pageSize = s;
+        const sel = document.getElementById('pageSizeSelect');
+        if (sel) sel.value = String(pageSize);
+    }
+
+    function _writeStateToUrl() {
+        const url = new URL(location.href);
+        if (currentPage > 1) url.searchParams.set('page', String(currentPage));
+        else url.searchParams.delete('page');
+        if (searchQuery) url.searchParams.set('q', searchQuery);
+        else url.searchParams.delete('q');
+        // Only persist a non-default size — keeps URLs short for the
+        // overwhelmingly common case where the admin is fine with 10/page.
+        if (pageSize !== 10) url.searchParams.set('size', String(pageSize));
+        else url.searchParams.delete('size');
+        history.replaceState(null, '', url.toString());
+    }
+
+    function changePageSize(n) {
+        if (!PAGE_SIZE_OPTIONS.includes(n)) return;
+        if (n === pageSize) return;
+        pageSize = n;
+        // Reset to page 1 — recomputing "the same user on a different page
+        // size" usually isn't what the admin wants; they're widening/narrowing
+        // the view to see more or less at once.
+        currentPage = 1;
+        _writeStateToUrl();
+        refreshUsersList();
+    }
+
     function handleSearch(val) {
         clearTimeout(searchTimeout);
         searchTimeout = setTimeout(() => {
             searchQuery = val;
             currentPage = 1;
+            _writeStateToUrl();
             refreshUsersList();
         }, 300);
     }
 
     function changePage(delta) {
         currentPage += delta;
+        _writeStateToUrl();
         refreshUsersList();
+    }
+
+    function goToPage(n) {
+        if (n < 1) n = 1;
+        if (n === currentPage) return;
+        currentPage = n;
+        _writeStateToUrl();
+        refreshUsersList();
+    }
+
+    function _renderPageNumbers(curr, total) {
+        // Pick which page numbers to show. With few pages we list them all;
+        // with many we use a sliding window around the current page plus
+        // bookends (1 and last) with "…" gaps. Keeps the bar from
+        // exploding when the user has 50+ pages.
+        const container = document.getElementById('pageNumbers');
+        if (!container) return;
+        if (total <= 1) { container.innerHTML = ''; return; }
+
+        const NEAR = 2;  // how many pages to show on each side of current
+        const pages = new Set([1, total, curr]);
+        for (let i = curr - NEAR; i <= curr + NEAR; i++) {
+            if (i >= 1 && i <= total) pages.add(i);
+        }
+        const sorted = [...pages].sort((a, b) => a - b);
+
+        const parts = [];
+        let prev = 0;
+        for (const p of sorted) {
+            if (prev && p > prev + 1) {
+                parts.push(`<span style="color:var(--text-muted); padding:0 4px;">…</span>`);
+            }
+            const isCurr = p === curr;
+            parts.push(
+                `<button class="btn btn-${isCurr ? 'primary' : 'secondary'} btn-sm"
+                         onclick="goToPage(${p})"
+                         style="min-width: 36px; padding: 6px 10px;"
+                         ${isCurr ? 'aria-current="page"' : ''}>${p}</button>`
+            );
+            prev = p;
+        }
+        container.innerHTML = parts.join('');
     }
 
     async function refreshUsersList() {
@@ -482,7 +586,7 @@
                              ${u.traffic_reset_strategy !== 'never' ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>` : ''}
                         </div>
                     </div>
-                    <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; max-width: 140px;">
+                    <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; gap:4px;">
                         {% if current_user.role == 'admin' %}
                         <button class="btn btn-secondary btn-sm btn-icon" 
                                 onclick="openAddConnectionForUser('${u.id}', '${u.username}')" 
@@ -517,6 +621,7 @@
             document.getElementById('pageInfo').textContent = _('page_info').replace('{}', data.page).replace('{}', data.pages || 1);
             document.getElementById('prevPage').disabled = (data.page <= 1);
             document.getElementById('nextPage').disabled = (data.page >= data.pages);
+            _renderPageNumbers(data.page, data.pages || 1);
 
             loading.classList.add('hidden');
             container.classList.remove('hidden');
@@ -525,8 +630,12 @@
         }
     }
 
-    // Call on load
-    document.addEventListener('DOMContentLoaded', refreshUsersList);
+    // Call on load — pull page/search from URL first so a refresh lands us
+    // back where we were instead of resetting to page 1.
+    document.addEventListener('DOMContentLoaded', () => {
+        _readStateFromUrl();
+        refreshUsersList();
+    });
 
     function updateProtocols(serverId, selectId, groupId = null) {
         const select = document.getElementById(selectId);

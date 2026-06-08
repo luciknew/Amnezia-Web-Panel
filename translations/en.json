@@ -134,6 +134,7 @@
     "prev_page": "← Back",
     "next_page": "Next →",
     "page_info": "Page {} of {}",
+    "per_page_label": "Per page:",
     "loading_users": "Loading users...",
     "nothing_found": "Nothing found",
     "search_empty_desc": "Try changing your query or create a new user",

@@ -133,6 +133,7 @@
     "prev_page": "← Retour",
     "next_page": "Suivant →",
     "page_info": "Page {} sur {}",
+    "per_page_label": "Par page :",
     "loading_users": "Chargement des utilisateurs...",
     "nothing_found": "Rien trouvé",
     "search_empty_desc": "Essayez une autre requête ou créez un utilisateur",

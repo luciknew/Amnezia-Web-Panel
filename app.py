@@ -2784,7 +2784,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(manager.get_client_config, req.protocol, req.client_id, get_client_host(server), port)
+            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, get_client_host(server), port)
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
@@ -2863,7 +2863,8 @@ def _fetch_connection_payload(data: dict, conn: dict) -> dict:
     ssh.connect()
     try:
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(
+        config = _manager_call(
+            manager, 'get_client_config',
             conn['protocol'], conn['client_id'], get_client_host(server), port
         )
     finally:
@@ -3267,7 +3268,7 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         ssh.connect()
         # Use appropriate manager for the protocol
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
         qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []
@@ -3300,7 +3301,7 @@ async def api_my_connection_config(request: Request, connection_id: str):
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], get_client_host(server), port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
         vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
         qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []

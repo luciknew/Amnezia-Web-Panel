@@ -2313,6 +2313,12 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
             mgr.save_server_config(req.protocol, req.config)
         ssh.disconnect()
         return {'status': 'success'}
+    except ValueError as e:
+        # Config failed validation (e.g. Telemt username that TOML would read
+        # as a table) -- the config was never written, so this is bad input,
+        # not a server fault.
+        logger.warning("Rejected invalid server config: %s", e)
+        return JSONResponse({'error': str(e)}, status_code=400)
     except Exception as e:
         logger.exception("Error saving server config")
         return JSONResponse({'error': str(e)}, status_code=500)

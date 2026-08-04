@@ -12,7 +12,17 @@ logger = logging.getLogger(__name__)
 class TelemtManager:
     CONTAINER_NAME = "telemt"
     API_URL = "http://127.0.0.1:9091"
-    
+    CONFIG_PATH = "/opt/amnezia/telemt/config.toml"
+    # Sections whose keys are usernames (and therefore must be safe TOML bare keys).
+    USER_KEYED_SECTIONS = (
+        "access.users",
+        "access.user_data_quota",
+        "access.user_max_unique_ips",
+        "access.user_expirations",
+        "access.user_ad_tags",
+        "access.user_max_tcp_conns",
+    )
+
     def __init__(self, ssh_manager: SSHManager):
         self.ssh = ssh_manager
 
@@ -212,13 +222,142 @@ docker compose version
             "log": results
         }
 
+    # Cyrillic -> Latin so that a Russian display name survives as something
+    # readable instead of collapsing into underscores ("Иванов И.И." used to
+    # sanitize down to an empty key and get a random uuid name).
+    _TRANSLIT = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+
+    @classmethod
+    def _transliterate(cls, text):
+        out = []
+        for ch in text:
+            low = ch.lower()
+            if low in cls._TRANSLIT:
+                mapped = cls._TRANSLIT[low]
+                out.append(mapped.capitalize() if ch.isupper() and mapped else mapped)
+            else:
+                out.append(ch)
+        return ''.join(out)
+
+    @staticmethod
+    def _is_safe_key(key):
+        """True if `key` is a TOML bare key Telemt will read as a plain name."""
+        return bool(re.fullmatch(r'[A-Za-z0-9_-]+', key or ''))
+
+    @classmethod
+    def _sanitize_username(cls, name):
+        """Coerce an arbitrary display name into a safe TOML bare key.
+
+        TOML bare keys only allow [A-Za-z0-9_-]; a literal dot is the
+        nested-table separator, so `foo.bar = "x"` parses as the table `[foo]`
+        with member `bar` rather than a scalar named `foo.bar`.  Telemt then
+        dies at startup with "invalid type: map, expected a string" and stays
+        in a restart loop -- i.e. one bad name takes down the proxy for every
+        user on the server.  Replace (rather than strip) unsafe runs so that
+        an all-non-ASCII name doesn't collapse into an empty key.
+        """
+        username = cls._transliterate((name or '').strip())
+        username = re.sub(r'[^A-Za-z0-9_-]+', '_', username.replace(' ', '_')).strip('_')
+        return username or ("user_" + uuid.uuid4().hex[:8])
+
+    @classmethod
+    def _repair_key(cls, key):
+        """Minimal fix for an existing config key: only touch unsafe ones.
+
+        Deliberately NOT _sanitize_username(): that one falls back to a random
+        uuid name, which would rename a live user (e.g. the legacy `_` key on
+        anubis) and desync them from the panel on every single write.
+        """
+        repaired = re.sub(r'[^A-Za-z0-9_-]+', '_', cls._transliterate(key)).strip('_')
+        return repaired or 'user_' + re.sub(r'[^a-f0-9]', '', uuid.uuid5(uuid.NAMESPACE_DNS, key).hex)[:8]
+
+    @classmethod
+    def _normalize_config_keys(cls, config_text):
+        """Rewrite unsafe usernames already present in a config.
+
+        Guards against configs written by an older panel build (whose regex
+        kept dots) and against hand edits made through the raw-config editor.
+        Returns (config_text, renames) where renames maps old -> new.
+        """
+        lines = config_text.split('\n')
+        section = None
+        renames = {}
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                section = stripped[1:-1].strip()
+                continue
+            if section not in cls.USER_KEYED_SECTIONS:
+                continue
+            # Disabled users are stored commented out; keep that marker intact.
+            m = re.match(r'^(\s*)(#\s*)?([^#\s=\[\]"\']+)(\s*=\s*)(.*)$', raw)
+            if not m:
+                continue
+            indent, comment, key, eq, value = m.groups()
+            if cls._is_safe_key(key):
+                continue
+            safe = cls._repair_key(key)
+            if safe == key:
+                continue
+            renames[key] = safe
+            lines[i] = f"{indent}{comment or ''}{safe}{eq}{value}"
+        return '\n'.join(lines), renames
+
+    @staticmethod
+    def _validate_config(config_text):
+        """Return a list of fatal problems; empty means Telemt should accept it."""
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - Python < 3.11
+            return []
+        try:
+            data = tomllib.loads(config_text)
+        except Exception as exc:
+            return [f"TOML syntax error: {exc}"]
+        users = (data.get('access') or {}).get('users') or {}
+        if not isinstance(users, dict):
+            return ["[access.users] is not a table"]
+        problems = [
+            f"user '{name}' has a {type(secret).__name__} value, expected a string"
+            for name, secret in users.items() if not isinstance(secret, str)
+        ]
+        if not users:
+            problems.append("no users configured - Telemt refuses to start with an empty [access.users]")
+        return problems
+
+    def _upload_config(self, config_text):
+        """Normalize, validate and only then push config.toml to the server.
+
+        Every write to config.toml goes through here so a malformed config
+        can never reach the server and crash-loop the container.
+        """
+        config_text = config_text.replace('\r\n', '\n')
+        config_text, renames = self._normalize_config_keys(config_text)
+        if renames:
+            logger.warning(
+                "Telemt config on %s contained unsafe usernames, normalized: %s",
+                getattr(self.ssh, 'host', '?'),
+                ', '.join(f"{old} -> {new}" for old, new in renames.items()),
+            )
+        problems = self._validate_config(config_text)
+        if problems:
+            raise ValueError("Refusing to write an invalid Telemt config: " + "; ".join(problems))
+        self.ssh.upload_file_sudo(config_text, self.CONFIG_PATH)
+        return renames
+
     def _get_server_config(self):
-        out, _, code = self.ssh.run_sudo_command(f"cat /opt/amnezia/telemt/config.toml")
+        out, _, code = self.ssh.run_sudo_command(f"cat {self.CONFIG_PATH}")
         if code != 0: return ""
         return out
 
     def save_server_config(self, protocol_type, config_content):
-        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_content)
         # Use SIGHUP (HUP) to reload MTProxy config without restarting the process/container.
         # This keeps the traffic statistics (octets) in memory.
         self.ssh.run_sudo_command(f"docker kill -s HUP {self.CONTAINER_NAME} || docker restart {self.CONTAINER_NAME}")
@@ -356,17 +495,8 @@ docker compose version
         return users
 
     def add_client(self, protocol_type, name, host='', port='', **kwargs):
-        # TOML "bare keys" only allow [A-Za-z0-9_-]; a literal dot is the
-        # nested-table separator, so `foo.bar = "x"` parses as the table
-        # `[foo]` with member `bar`, not as a scalar with the dotted name.
-        # The previous regex kept dots in usernames, which produced a config
-        # like `Karavan_kapranova.e_vpn = "..."` and crashed Telemt at startup
-        # with "expected a string, got map".  Replace anything outside the
-        # safe set with underscores (vs stripping) so we don't produce empty
-        # keys for usernames that were all-non-ASCII either.
-        username = re.sub(r'[^A-Za-z0-9_-]+', '_', name.replace(' ', '_')).strip('_')
-        if not username: username = "user_" + uuid.uuid4().hex[:8]
-        
+        username = self._sanitize_username(name)
+
         config_text = self._get_server_config()
         current_users = self._parse_users_from_config(config_text)
         idx = 1
@@ -411,7 +541,7 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_text)
         
         # 2. Call API for immediate effect
         self._api_request("POST", "/v1/users", data=api_payload)
@@ -475,7 +605,7 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_text)
         
         # API call
         self._api_request("PATCH", f"/v1/users/{client_id}", data=api_payload)
@@ -542,7 +672,7 @@ docker compose version
             if stripped.startswith(f"{client_id} ") or stripped.startswith(f"{client_id}="):
                 continue
             new_lines.append(line)
-        self.ssh.upload_file_sudo('\n'.join(new_lines).replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config('\n'.join(new_lines))
 
     def toggle_client(self, protocol_type, client_id, enable, restart=True):
         # API doesn't have a direct "toggle", so we either set a huge quota or remove/re-add
@@ -564,7 +694,7 @@ docker compose version
                     line = base_line if enable else f"# {base_line}"
             new_lines.append(line)
         
-        self.ssh.upload_file_sudo('\n'.join(new_lines).replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config('\n'.join(new_lines))
         
         if enable:
             # If enabling, we re-add via API since it might have been deleted from memory

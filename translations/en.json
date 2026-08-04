@@ -354,5 +354,14 @@
     "checking_updates": "Checking...",
     "update_available": "New version available",
     "download_update": "Download update",
-    "up_to_date": "You have the latest version"
+    "up_to_date": "You have the latest version",
+    "backup": "Backup",
+    "backups": "Backups",
+    "backup_desc": "Backups are created on the server and contain valuable protocol files needed to restore or recreate it later.",
+    "create_backup": "Create backup",
+    "creating_backup": "Creating backup...",
+    "backup_created": "Backup created",
+    "no_backups": "No backups yet",
+    "no_backups_desc": "Create the first backup for this protocol.",
+    "refresh": "Refresh"
 }

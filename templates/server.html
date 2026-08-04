@@ -687,6 +687,30 @@
         </div>
     </div>
 </div>
+
+<!-- ===== Protocol Backup Modal ===== -->
+<div class="modal-backdrop" id="backupModal">
+    <div class="modal" style="max-width:560px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="backupModalTitle">{{ _('backups') }}</h2>
+            <button class="modal-close" onclick="closeModal('backupModal')">×</button>
+        </div>
+        <input type="hidden" id="backupProto" value="" />
+        <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('backup_desc') }}</div>
+        <div style="display:flex; gap:var(--space-sm); margin-bottom:var(--space-md);">
+            <button class="btn btn-primary btn-sm" onclick="createProtocolBackup()" id="createBackupBtn" style="flex:1">
+                {{ _('create_backup') }}
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="loadProtocolBackups()">{{ _('refresh') }}</button>
+        </div>
+        <div id="backupLoading" class="form-hint hidden">{{ _('loading') }}</div>
+        <div id="backupEmpty" class="empty-state hidden" style="padding:var(--space-xl);">
+            <div class="empty-title">{{ _('no_backups') }}</div>
+            <div class="empty-desc">{{ _('no_backups_desc') }}</div>
+        </div>
+        <div id="backupList" style="display:flex; flex-direction:column; gap:var(--space-sm);"></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -944,13 +968,19 @@
             // unbound's static config), so we don't expose a raw editor for them.
             if (ctrlEl) {
                 ctrlEl.style.cssText = '';
+                // Backup sits on the control row for every protocol (services
+                // included — their configs are worth archiving too), so we add
+                // it once here instead of per-protocol like upstream does.
+                const backupBtn = `<button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')" title="${_('backup_desc')}">${_('backup')}</button>`;
                 if (isService) {
                     ctrlEl.innerHTML = `
+                        ${backupBtn}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
                     ctrlEl.innerHTML = `
                         <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
+                        ${backupBtn}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 }
@@ -1197,6 +1227,98 @@
             logEl.scrollTop = logEl.scrollHeight;
             showToast(_('install_error') + err.message, 'error');
             document.getElementById('installDone').style.display = '';
+        }
+    }
+
+    // ===== Protocol backups =====
+    function formatBackupTime(mtime) {
+        if (!mtime) return '—';
+        try { return new Date(mtime * 1000).toLocaleString(); } catch (_) { return '—'; }
+    }
+
+    async function showProtocolBackups(proto) {
+        document.getElementById('backupProto').value = proto;
+        document.getElementById('backupModalTitle').textContent = `${_('backups')} — ${getProtoTitle(proto)}`;
+        openModal('backupModal');
+        await loadProtocolBackups();
+    }
+
+    async function loadProtocolBackups() {
+        const proto = document.getElementById('backupProto').value;
+        const list = document.getElementById('backupList');
+        const empty = document.getElementById('backupEmpty');
+        const loading = document.getElementById('backupLoading');
+        list.innerHTML = '';
+        empty.classList.add('hidden');
+        loading.classList.remove('hidden');
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/backups`, 'POST', { protocol: proto });
+            const backups = res.backups || [];
+            if (!backups.length) {
+                empty.classList.remove('hidden');
+                return;
+            }
+            list.innerHTML = backups.map(b => `
+                <div class="protocol-info-item" style="flex-direction:row; align-items:center; gap:var(--space-sm);">
+                    <div style="min-width:0; flex:1;">
+                        <div class="protocol-info-value" style="word-break:break-all;">${b.name}</div>
+                        <div class="protocol-info-label">${formatBytes(b.size)} • ${formatBackupTime(b.mtime)}</div>
+                    </div>
+                    <button class="btn btn-secondary btn-sm" onclick="downloadProtocolBackup('${proto}', '${b.name}')">${_('download')}</button>
+                </div>
+            `).join('');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            loading.classList.add('hidden');
+        }
+    }
+
+    async function createProtocolBackup() {
+        const proto = document.getElementById('backupProto').value;
+        const btn = document.getElementById('createBackupBtn');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = _('creating_backup');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/backups/create`, 'POST', { protocol: proto });
+            showToast(_('backup_created'), 'success');
+            await loadProtocolBackups();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+        }
+    }
+
+    async function downloadProtocolBackup(proto, filename) {
+        try {
+            // Not apiCall(): the response is a binary archive, not JSON.
+            const res = await fetch(`/api/servers/${SERVER_ID}/backups/download`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ protocol: proto, filename })
+            });
+            if (!res.ok) {
+                let message = 'Download failed';
+                try {
+                    const data = await res.json();
+                    message = data.error || message;
+                } catch (_) {}
+                throw new Error(message);
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
         }
     }
 

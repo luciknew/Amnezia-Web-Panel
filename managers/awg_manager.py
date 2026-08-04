@@ -66,8 +66,15 @@ def generate_psk():
 
 
 def generate_awg_params(use_ranges=False):
-    """Generate random AWG obfuscation parameters."""
+    """Generate random AWG obfuscation parameters.
+    
+    For AWG 2.0 (use_ranges=True): generates H1-H4 as non-overlapping
+    ranges (min-max) for dynamic packet signature. Each packet gets a
+    random value from its range, defeating static DPI signatures.
+    For legacy AWG (use_ranges=False): generates fixed single H values.
+    """
     import random
+
     jc = random.randint(1, 10)
     jmin = random.randint(5, 20)
     jmax = random.randint(jmin + 10, jmin + 50)
@@ -77,11 +84,22 @@ def generate_awg_params(use_ranges=False):
     s4 = random.randint(10, 50)
 
     if use_ranges:
-        # Standard AWG 2.0 headers. Use single large numbers.
-        h1 = str(random.randint(1000000000, 4294967295))
-        h2 = str(random.randint(1000000000, 4294967295))
-        h3 = str(random.randint(1000000000, 4294967295))
-        h4 = str(random.randint(1000000000, 4294967295))
+        # AWG 2.0: H1-H4 as non-overlapping ranges (min-max)
+        # Split [1B, 4.29B] into 4 equal zones, pick random sub-range in each
+        # Guarantees no intersections between H1-H4 per AWG 2.0 spec
+        def make_ranges(total_min=1000000000, total_max=4294967295):
+            zone_size = (total_max - total_min) // 4
+            result = []
+            for i in range(4):
+                z_start = total_min + i * zone_size
+                z_end = z_start + zone_size - 1
+                padding = min(100000, zone_size // 4)
+                a = random.randint(z_start + padding, z_end - padding)
+                b = random.randint(a + 1, z_end)
+                result.append(f"{a}-{b}")
+            return result
+        
+        h1, h2, h3, h4 = make_ranges()
     else:
         h1 = str(random.randint(100000000, 4294967295))
         h2 = str(random.randint(100000000, 4294967295))
@@ -114,17 +132,36 @@ class AWGManager:
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
 
+    def _base_protocol(self, protocol_type):
+        """Return base protocol for instance keys like awg__2."""
+        return str(protocol_type or self.AWG).split('__', 1)[0]
+
+    def _instance_index(self, protocol_type):
+        parts = str(protocol_type or '').split('__', 1)
+        if len(parts) == 2:
+            try:
+                return max(1, int(parts[1]))
+            except ValueError:
+                return 1
+        return 1
+
     def _container_name(self, protocol_type):
-        """Get Docker container name for protocol type."""
-        if protocol_type == self.AWG_LEGACY:
-            return 'amnezia-awg-legacy'
-        if protocol_type == self.AWG2:
-            return 'amnezia-awg2'
-        return 'amnezia-awg'
+        """Get Docker container name for protocol type/instance.
+        First instances keep legacy names; additional instances get -N suffix.
+        """
+        base = self._base_protocol(protocol_type)
+        idx = self._instance_index(protocol_type)
+        if base == self.AWG_LEGACY:
+            name = 'amnezia-awg-legacy'
+        elif base == self.AWG2:
+            name = 'amnezia-awg2'
+        else:
+            name = 'amnezia-awg'
+        return name if idx <= 1 else f'{name}-{idx}'
 
     def _config_path(self, protocol_type):
         """Get server config path inside container."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return '/opt/amnezia/awg/wg0.conf'
         # Both AWG and AWG2 use awg0.conf
         return '/opt/amnezia/awg/awg0.conf'
@@ -132,7 +169,7 @@ class AWGManager:
     def _config_path_candidates(self, protocol_type):
         """Return possible config paths, ordered by the expected path first."""
         expected = self._config_path(protocol_type)
-        fallback = '/opt/amnezia/awg/awg0.conf' if protocol_type == self.AWG_LEGACY else '/opt/amnezia/awg/wg0.conf'
+        fallback = '/opt/amnezia/awg/awg0.conf' if self._base_protocol(protocol_type) == self.AWG_LEGACY else '/opt/amnezia/awg/wg0.conf'
         return [expected, fallback]
 
     def _resolve_config_path(self, protocol_type):
@@ -155,7 +192,7 @@ class AWGManager:
 
     def _wg_binary(self, protocol_type):
         """Get the wireguard binary name."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg'
         # AWG and AWG2 both use 'awg' binary
         return 'awg'
@@ -163,7 +200,7 @@ class AWGManager:
 
     def _quick_binary(self, protocol_type):
         """Get the wireguard-quick binary name."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg-quick'
         # AWG and AWG2 both use 'awg-quick'
         return 'awg-quick'
@@ -173,20 +210,57 @@ class AWGManager:
         """Get the interface name."""
         if config_path:
             return os.path.splitext(os.path.basename(config_path))[0]
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg0'
         # AWG and AWG2 both use 'awg0' interface
         return 'awg0'
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
-        if protocol_type in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
             return 'amneziavpn/amneziawg-go:latest'
         return 'amneziavpn/amnezia-wg:latest'
 
     def _clients_table_path(self):
         """Path to the clients table file inside container."""
         return '/opt/amnezia/awg/clientsTable'
+
+    def _get_subnet_ip(self, protocol_type):
+        """Get the subnet IP (gateway) from server config, or fallback to default."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                if line.startswith('Address'):
+                    addr = line.split('=')[1].strip()
+                    ip = addr.split('/')[0]
+                    return ip
+        except Exception:
+            pass
+        return AWG_DEFAULTS['subnet_ip']
+
+    def _get_subnet_cidr(self, protocol_type):
+        """Get the subnet CIDR from server config, or fallback to default."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                if line.startswith('Address'):
+                    addr = line.split('=')[1].strip()
+                    if '/' in addr:
+                        return addr.split('/')[1]
+        except Exception:
+            pass
+        return AWG_DEFAULTS['subnet_cidr']
+
+    def _get_subnet_base(self, protocol_type):
+        """Get the subnet network address (e.g. 172.16.21.0) from server config."""
+        subnet_ip = self._get_subnet_ip(protocol_type)
+        cidr = int(self._get_subnet_cidr(protocol_type))
+        parts = list(map(int, subnet_ip.split('.')))
+        mask = (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF
+        network = struct.pack('!I', (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
+        net_int = struct.unpack('!I', network)[0] & mask
+        net_parts = [(net_int >> 24) & 0xFF, (net_int >> 16) & 0xFF, (net_int >> 8) & 0xFF, net_int & 0xFF]
+        return '.'.join(map(str, net_parts))
 
     # ===================== INSTALLATION =====================
 
@@ -277,7 +351,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(protocol_type in (self.AWG, self.AWG2)))
+            awg_params = generate_awg_params(use_ranges=(self._base_protocol(protocol_type) in (self.AWG, self.AWG2)))
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -417,11 +491,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._config_path(protocol_type)
 
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
+        subnet_ip = self._get_subnet_ip(protocol_type)
+        subnet_cidr = self._get_subnet_cidr(protocol_type)
 
         # Build the server config generation script
-        if protocol_type in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -501,11 +575,15 @@ EOF
         container_name = self._container_name(protocol_type)
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Read subnet from server config dynamically
+SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | tr -d ' ')
+if [ -z "$SUBNET" ]; then
+  SUBNET={AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}
+fi
 
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
@@ -520,13 +598,13 @@ iptables -A FORWARD -i $IFACE -j ACCEPT
 iptables -A OUTPUT -o $IFACE -j ACCEPT
 
 # Allow forwarding traffic only from the VPN
-iptables -A FORWARD -i $IFACE -o eth0 -s {subnet_ip}/{subnet_cidr} -j ACCEPT
-iptables -A FORWARD -i $IFACE -o eth1 -s {subnet_ip}/{subnet_cidr} -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth0 -s $SUBNET -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth1 -s $SUBNET -j ACCEPT
 
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth0 -j MASQUERADE
-iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth1 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth1 -j MASQUERADE
 
 tail -f /dev/null
 """
@@ -616,6 +694,45 @@ tail -f /dev/null
         self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_edit_config.conf {container_name}:{config_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_edit_config.conf")
 
+        # Regenerate start script so iptables rules pick up the (possibly changed) subnet
+        quick_bin = self._quick_binary(protocol_type)
+        start_script = f"""#!/bin/bash
+echo "Container startup"
+
+# Read subnet from server config dynamically
+SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | tr -d ' ')
+if [ -z "$SUBNET" ]; then
+  SUBNET={AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}
+fi
+
+# kill daemons in case of restart
+{quick_bin} down {config_path} 2>/dev/null
+
+# start daemons if configured
+if [ -f {config_path} ]; then {quick_bin} up {config_path}; fi
+
+# Allow traffic on the TUN interface
+IFACE=$(basename {config_path} .conf)
+iptables -A INPUT -i $IFACE -j ACCEPT
+iptables -A FORWARD -i $IFACE -j ACCEPT
+iptables -A OUTPUT -o $IFACE -j ACCEPT
+
+# Allow forwarding traffic only from the VPN
+iptables -A FORWARD -i $IFACE -o eth0 -s $SUBNET -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth1 -s $SUBNET -j ACCEPT
+
+iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth1 -j MASQUERADE
+
+tail -f /dev/null
+"""
+        self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_start.sh {container_name}:/opt/amnezia/start.sh")
+        self.ssh.run_sudo_command(f"docker exec {container_name} chmod +x /opt/amnezia/start.sh")
+        self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
+
         # Restart container to apply all changes (including port and interface changes)
         self.ssh.run_sudo_command(f"docker restart {container_name}")
 
@@ -697,7 +814,7 @@ tail -f /dev/null
         """Calculate the next available IP for a new client."""
         used_ips = self._get_used_ips(protocol_type)
         if not used_ips:
-            base = AWG_DEFAULTS['subnet_address']
+            base = self._get_subnet_base(protocol_type)
             parts = base.split('.')
             parts[3] = '2'
             return '.'.join(parts)
@@ -716,6 +833,21 @@ tail -f /dev/null
 
         parts[3] = str(next_octet)
         return '.'.join(parts)
+
+    def _extract_ipv4(self, value):
+        """Extract the first IPv4 address from AllowedIPs/clientIp-like values."""
+        if not value:
+            return ''
+        match = re.search(r'(\d+\.\d+\.\d+\.\d+)', str(value))
+        return match.group(1) if match else ''
+
+    def _client_ip_from_userdata(self, user_data):
+        """Return a valid client IP from stored userData, tolerating native Amnezia records."""
+        return (
+            self._extract_ipv4(user_data.get('clientIp'))
+            or self._extract_ipv4(user_data.get('allowedIps'))
+            or self._extract_ipv4(user_data.get('allowed_ip'))
+        )
 
     def _parse_peers_from_config(self, protocol_type):
         """Parse [Peer] sections from WireGuard server config and return dict of pubkey -> {allowedIps}."""
@@ -955,7 +1087,7 @@ AllowedIPs = {client_ip}/32
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1047,7 +1179,7 @@ PersistentKeepalive = 25
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1068,10 +1200,13 @@ PersistentKeepalive = 25
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
         iface = self._interface_name(protocol_type, config_path)
+        clients_table = self._get_clients_table(protocol_type)
+        table_changed = False
 
         if enable:
-            # Re-add peer to server config
-            clients_table = self._get_clients_table(protocol_type)
+            # Re-add peer to server config. Native Amnezia clients may not have
+            # userData.clientIp in clientsTable, so recover it from allowedIps
+            # before falling back to a new free address.
             client = None
             for c in clients_table:
                 if c.get('clientId') == client_id:
@@ -1080,12 +1215,25 @@ PersistentKeepalive = 25
             if not client:
                 raise RuntimeError(f"Client {client_id} not found")
 
-            ud = client.get('userData', {})
+            ud = client.setdefault('userData', {})
             psk = ud.get('psk', '')
-            client_ip = ud.get('clientIp', '')
+            client_ip = self._client_ip_from_userdata(ud)
+            if not client_ip:
+                client_ip = self._get_next_ip(protocol_type)
+                logger.warning(
+                    "Client %s had no saved AWG IP/AllowedIPs; assigning next free IP %s",
+                    client_id,
+                    client_ip,
+                )
+
+            ud['clientIp'] = client_ip
+            ud['allowedIps'] = f'{client_ip}/32'
+            table_changed = True
 
             if not psk:
                 psk = self._get_server_psk(protocol_type)
+                ud['psk'] = psk
+                table_changed = True
 
             peer_section = f"""
 [Peer]
@@ -1099,8 +1247,37 @@ AllowedIPs = {client_ip}/32
                 f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
             )
         else:
-            # Remove peer from server config
+            # Remove peer from server config, but first persist its current
+            # AllowedIPs so native/external clients can be enabled later.
             config = self._get_server_config(protocol_type)
+            conf_peers = self._parse_peers_from_config(protocol_type)
+            allowed_ips = conf_peers.get(client_id, {}).get('allowedIps', '')
+            client_ip = self._extract_ipv4(allowed_ips)
+            client = None
+            for c in clients_table:
+                if c.get('clientId') == client_id:
+                    client = c
+                    break
+            if client is None:
+                client = {
+                    'clientId': client_id,
+                    'userData': {
+                        'clientName': f'External ({client_ip})' if client_ip else 'External (native app)',
+                        'externalClient': True,
+                    }
+                }
+                clients_table.append(client)
+                table_changed = True
+
+            ud = client.setdefault('userData', {})
+            if client_ip:
+                ud['clientIp'] = client_ip
+                ud['allowedIps'] = allowed_ips or f'{client_ip}/32'
+                table_changed = True
+            if not ud.get('psk'):
+                ud['psk'] = self._get_server_psk(protocol_type)
+                table_changed = True
+
             sections = config.split('[')
             new_sections = []
             for section in sections:
@@ -1123,12 +1300,13 @@ AllowedIPs = {client_ip}/32
         )
 
         # Update enabled status in clients table
-        clients_table = self._get_clients_table(protocol_type)
         for c in clients_table:
             if c.get('clientId') == client_id:
                 c.setdefault('userData', {})['enabled'] = enable
+                table_changed = True
                 break
-        self._save_clients_table(protocol_type, clients_table)
+        if table_changed:
+            self._save_clients_table(protocol_type, clients_table)
 
     def remove_client(self, protocol_type, client_id):
         """Remove a client from AWG config (mirrors revokeWireGuard)."""

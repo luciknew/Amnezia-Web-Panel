@@ -322,5 +322,14 @@
     "promo_star_cta": "Star us on GitHub",
     "aivpn_subtitle": "AI-driven protocol selection that picks the right tunnel for the moment. Land it sooner — drop a star.",
     "revproxy_title": "Reverse Proxy",
-    "revproxy_subtitle": "High-performance traffic obfuscation: hide your VPN endpoint behind a polished public-facing site, drop the DPI footprint."
+    "revproxy_subtitle": "High-performance traffic obfuscation: hide your VPN endpoint behind a polished public-facing site, drop the DPI footprint.",
+    "backup": "پشتیبان",
+    "backups": "پشتیبان‌ها",
+    "backup_desc": "پشتیبان‌ها روی سرور ساخته می‌شوند و شامل فایل‌های پروتکل هستند که برای بازیابی یا راه‌اندازی دوباره بدون از دست رفتن داده لازم‌اند.",
+    "create_backup": "ایجاد پشتیبان",
+    "creating_backup": "در حال ایجاد پشتیبان...",
+    "backup_created": "پشتیبان ایجاد شد",
+    "no_backups": "هنوز پشتیبانی وجود ندارد",
+    "no_backups_desc": "اولین پشتیبان را برای این پروتکل بسازید.",
+    "refresh": "بازخوانی"
 }

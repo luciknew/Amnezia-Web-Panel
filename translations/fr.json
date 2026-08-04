@@ -322,5 +322,14 @@
     "promo_star_cta": "Star us on GitHub",
     "aivpn_subtitle": "AI-driven protocol selection that picks the right tunnel for the moment. Land it sooner — drop a star.",
     "revproxy_title": "Reverse Proxy",
-    "revproxy_subtitle": "High-performance traffic obfuscation: hide your VPN endpoint behind a polished public-facing site, drop the DPI footprint."
+    "revproxy_subtitle": "High-performance traffic obfuscation: hide your VPN endpoint behind a polished public-facing site, drop the DPI footprint.",
+    "backup": "Sauvegarde",
+    "backups": "Sauvegardes",
+    "backup_desc": "Les sauvegardes sont créées sur le serveur et contiennent les fichiers du protocole nécessaires à une restauration ou à un redémarrage sans perte.",
+    "create_backup": "Créer une sauvegarde",
+    "creating_backup": "Création de la sauvegarde...",
+    "backup_created": "Sauvegarde créée",
+    "no_backups": "Aucune sauvegarde",
+    "no_backups_desc": "Créez la première sauvegarde pour ce protocole.",
+    "refresh": "Actualiser"
 }

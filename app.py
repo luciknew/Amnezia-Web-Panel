@@ -8,11 +8,14 @@ import hashlib
 import struct
 import zlib
 import secrets
+import shlex
+import tempfile
 import uuid
 import asyncio
 from datetime import datetime
 import io
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File
@@ -31,6 +34,7 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.backup_manager import BackupManager
 from managers.email_manager import (
     SMTPSettings, EmailAttachment, send_email as smtp_send_email, render_qr_png,
 )
@@ -903,6 +907,11 @@ class Socks5SettingsRequest(BaseModel):
 
 class ProtocolRequest(BaseModel):
     protocol: str = 'awg'
+
+
+class BackupDownloadRequest(BaseModel):
+    protocol: str
+    filename: str
 
 
 class AddConnectionRequest(BaseModel):
@@ -2207,6 +2216,123 @@ CONTAINER_NAMES = {
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
 }
+
+
+@app.post('/api/servers/{server_id}/backups', tags=["Protocols"])
+async def api_protocol_backups_list(request: Request, server_id: int, req: ProtocolRequest):
+    """List backups created on the remote server for one protocol."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.protocol not in CONTAINER_NAMES:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        result = BackupManager(ssh).list_backups(req.protocol)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to list backups')}, status_code=500)
+        return result
+    except Exception as e:
+        logger.exception("Error listing protocol backups")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/create', tags=["Protocols"])
+async def api_protocol_backup_create(request: Request, server_id: int, req: ProtocolRequest):
+    """Create a protocol backup archive on the remote server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    container = CONTAINER_NAMES.get(req.protocol)
+    if not container:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        # Archiving can take a while on a busy server, so keep it off the event loop.
+        result = await asyncio.to_thread(BackupManager(ssh).create_backup, req.protocol, container)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to create backup')}, status_code=500)
+        return result
+    except Exception as e:
+        logger.exception("Error creating protocol backup")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/download', tags=["Protocols"])
+async def api_protocol_backup_download(request: Request, server_id: int, req: BackupDownloadRequest):
+    """Download one remote protocol backup archive through the panel."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.protocol not in CONTAINER_NAMES:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    manager = BackupManager(None)
+    safe_proto = manager.safe_protocol(req.protocol)
+    filename = manager.safe_filename(req.filename)
+    if not filename:
+        return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
+    ssh = None
+    tmp_path = None
+    tmp_remote = f'/tmp/{filename}'
+    remote_path = f'{manager.BACKUP_ROOT}/{safe_proto}/{filename}'
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        quoted_remote = shlex.quote(remote_path)
+        quoted_tmp = shlex.quote(tmp_remote)
+        # Copy to /tmp and relax the mode first: the archive is written with
+        # umask 077 under root, so SFTP as a non-root login can't read it.
+        _, err, code = ssh.run_sudo_command(
+            f"sh -c {shlex.quote(f'test -f {quoted_remote} && cp {quoted_remote} {quoted_tmp} && chmod 0644 {quoted_tmp}')}"
+        )
+        if code != 0:
+            return JSONResponse({'error': err or 'Backup not found'}, status_code=404)
+        fd, tmp_path = tempfile.mkstemp(prefix='amnezia-backup-', suffix='.tar.gz')
+        os.close(fd)
+        sftp = ssh.client.open_sftp()
+        try:
+            sftp.get(tmp_remote, tmp_path)
+        finally:
+            sftp.close()
+            ssh.run_sudo_command(f"rm -f {quoted_tmp}")
+            ssh.disconnect()
+            ssh = None
+        return FileResponse(
+            tmp_path,
+            media_type='application/gzip',
+            filename=filename,
+            background=BackgroundTask(lambda p=tmp_path: os.path.exists(p) and os.remove(p)),
+        )
+    except Exception as e:
+        logger.exception("Error downloading protocol backup")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/container/toggle', tags=["Protocols"])

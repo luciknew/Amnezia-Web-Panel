@@ -913,7 +913,13 @@
         }
     }
 
+    // Remembered so the modal can redraw itself after a connection is deleted.
+    let _connsUserId = null;
+    let _connsUserName = '';
+
     async function viewUserConnections(userId, username) {
+        _connsUserId = userId;
+        _connsUserName = username;
         document.getElementById('userConnsTitle').textContent = `${_('connections')} — ${username}`;
         const listEl = document.getElementById('userConnsList');
         listEl.innerHTML = `<div style="text-align:center;padding:var(--space-lg);color:var(--text-muted);">${_('loading')}</div>`;
@@ -940,12 +946,32 @@
                         </div>
                         <div class="client-actions">
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showUserConnectionConfig(${c.server_id}, '${c.client_id}', '${c.protocol}', '${(c.name || 'VPN').replace(/'/g, "\\'")}')" title="${_('config')}">📄</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="deleteUserConnection(${c.server_id}, '${c.client_id}', '${c.protocol}', '${(c.name || 'VPN').replace(/'/g, "\\'")}', '${(c.server_name || '').replace(/'/g, "\\'")}')" title="${_('delete')}">🗑</button>
                         </div>
                     </div>
                 `;
             });
         } catch (err) {
             listEl.innerHTML = `<div style="color:#ef4444;padding:var(--space-md);">${_('error')}: ${err.message}</div>`;
+        }
+    }
+
+    async function deleteUserConnection(serverId, clientId, protocol, name, serverName) {
+        // A user often has the same connection name on several servers, so the
+        // prompt spells out which server this one lives on.
+        const target = serverName ? `${name} — ${serverName}` : name;
+        if (!confirm(`${_('delete_connection_confirm')}\n\n${target}`)) return;
+        try {
+            await apiCall(`/api/servers/${serverId}/connections/remove`, 'POST', {
+                protocol: protocol, client_id: clientId,
+            });
+            showToast(_('connection_deleted'), 'success');
+            // Redraw the modal, then refresh the row behind it so the
+            // connection counter doesn't go stale.
+            if (_connsUserId !== null) await viewUserConnections(_connsUserId, _connsUserName);
+            refreshUsersList();
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
         }
     }
 

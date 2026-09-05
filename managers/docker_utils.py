@@ -62,12 +62,29 @@ def ensure_docker_compose(ssh):
         raise RuntimeError(f"Failed to install docker compose plugin: {err or out}")
 
 
+# Markers of "the v2 plugin isn't here", as opposed to "the command ran and
+# failed". Only the former justifies retrying with v1: retrying a genuine
+# failure replaces its message with `docker-compose: not found` and hides the
+# real cause (that cost us a wrong diagnosis on a permission error once).
+_V2_MISSING = (
+    "is not a docker command",
+    "unknown docker command",
+    "docker: not found",
+    "docker: command not found",
+)
+
+
+def _v2_plugin_missing(output):
+    lowered = (output or '').lower()
+    return any(marker in lowered for marker in _V2_MISSING)
+
+
 def compose_exec(ssh, remote_dir, args, timeout=900):
     """Run an arbitrary `docker compose` subcommand, falling back to v1 syntax."""
     out, err, code = ssh.run_sudo_command(
         f"sh -c 'cd {remote_dir} && docker compose {args}'", timeout=timeout)
-    if code != 0:
-        out, err, code = ssh.run_sudo_command(
+    if code != 0 and _v2_plugin_missing(f"{out}\n{err}"):
+        return ssh.run_sudo_command(
             f"sh -c 'cd {remote_dir} && docker-compose {args}'", timeout=timeout)
     return out, err, code
 
@@ -75,7 +92,4 @@ def compose_exec(ssh, remote_dir, args, timeout=900):
 def compose_up(ssh, remote_dir, timeout=900, build=True):
     """Run `docker compose up -d` in `remote_dir`, falling back to v1 syntax."""
     flags = "-d --build" if build else "-d"
-    out, err, code = ssh.run_sudo_command(f"sh -c 'cd {remote_dir} && docker compose up {flags}'", timeout=timeout)
-    if code != 0:
-        out, err, code = ssh.run_sudo_command(f"sh -c 'cd {remote_dir} && docker-compose up {flags}'", timeout=timeout)
-    return out, err, code
+    return compose_exec(ssh, remote_dir, f"up {flags}", timeout=timeout)

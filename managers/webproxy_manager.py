@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 
 CARRIER_MODES = ('https', 'https-lanes', 'websocket', 'websocket-lanes')
 
+# Who owns what on the server. `upload_file_sudo` keeps the SSH user as owner
+# (SFTP to /tmp, then `sudo mv`), so every uploaded file gets an explicit chown.
+# The relay runs as root but with all capabilities dropped -- no CAP_DAC_OVERRIDE,
+# so it can only read files it actually owns. ghcr.io/telemt/telemt runs as
+# nonroot:nonroot (uid/gid 65532).
+RELAY_OWNER = '0:0'
+BACKEND_OWNER = '65532:65532'
+
 
 class WebProxyManager:
     CONTAINER_NAME = "amnezia-webproxy"          # the relay; primary for status
@@ -45,9 +53,6 @@ class WebProxyManager:
     REMOTE_DIR = "/opt/amnezia/webproxy"
     ADMIN_URL = "http://127.0.0.1:8081"
     BACKEND_ADDR = "127.0.0.1:2398"
-    # ghcr.io/telemt/telemt runs as nonroot:nonroot (uid/gid 65532), so its
-    # config has to be owned by that uid to stay readable at 0600.
-    BACKEND_OWNER = "65532:65532"
     LOCAL_ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'protocol_webproxy')
 
     def __init__(self, ssh_manager: SSHManager):
@@ -199,19 +204,26 @@ class WebProxyManager:
             logger.warning("Malformed JSON at %s on %s", path, getattr(self.ssh, 'host', '?'))
             return None
 
-    def _upload_secret_file(self, content, path, owner=None):
+    def _upload_secret_file(self, content, path, owner=RELAY_OWNER):
         """Upload, then tighten perms: loadProfiles refuses a profiles file
         that is readable or writable by group or others.
 
-        `owner` exists for the MTProxy backend config: that image runs as
-        `nonroot`, so a root-owned 0600 file is unreadable inside the container
-        and it just crash-loops with exit 1. The relay's own files need no
-        chown -- its image runs as root.
+        Ownership is always set explicitly, because `upload_file_sudo` writes
+        the file over SFTP as the *SSH user* and then `sudo mv`s it, which
+        keeps that user as the owner. On a panel that logs in as a non-root
+        sudo user the result is a 0600 file owned by uid 1000 -- and neither
+        container can read it: the relay runs as root but with `cap_drop: ALL`
+        it has no CAP_DAC_OVERRIDE, and the MTProxy backend runs as nonroot.
         """
         self.ssh.upload_file_sudo(content, path)
-        if owner:
-            self.ssh.run_sudo_command(f"chown {owner} {path}")
+        self.ssh.run_sudo_command(f"chown {owner} {path}")
         self.ssh.run_sudo_command(f"chmod 600 {path}")
+
+    def _upload_public_file(self, content, path):
+        """World-readable config the containers must read; same ownership
+        caveat as `_upload_secret_file`, so set the owner explicitly."""
+        self.ssh.upload_file_sudo(content, path)
+        self.ssh.run_sudo_command(f"chown {RELAY_OWNER} {path}")
 
     def _ensure_token_key(self):
         """Provision the relay's 32-byte token-signing key, once per install.
@@ -298,7 +310,7 @@ chmod 600 {path}
         backend_toml = self._read_remote(backend_path)
         if backend_toml.strip():
             self._upload_secret_file(self._render_backend_users(clients, backend_toml), backend_path,
-                                     owner=self.BACKEND_OWNER)
+                                     owner=BACKEND_OWNER)
 
         if restart:
             self.restart()
@@ -408,11 +420,11 @@ chmod 600 {path}
         # The backend mounts this directory as its working dir and caches
         # proxy-secret and its state files there; as root it only gets
         # "Permission denied (non-fatal)" and re-downloads on every start.
-        self.ssh.run_sudo_command(f"chown {self.BACKEND_OWNER} {self.REMOTE_DIR}/backend")
+        self.ssh.run_sudo_command(f"chown {BACKEND_OWNER} {self.REMOTE_DIR}/backend")
 
         for name in ('Dockerfile', 'docker-compose.yml', 'Caddyfile'):
             with open(os.path.join(self.LOCAL_ASSETS, name), encoding='utf-8') as fh:
-                self.ssh.upload_file_sudo(fh.read(), f"{self.REMOTE_DIR}/{name}")
+                self._upload_public_file(fh.read(), f"{self.REMOTE_DIR}/{name}")
 
         with open(os.path.join(self.LOCAL_ASSETS, 'config.json'), encoding='utf-8') as fh:
             config = json.load(fh)
@@ -425,9 +437,9 @@ chmod 600 {path}
         else:
             config['public_dir'] = '/srv/tproxy-site'
             config.pop('public_upstream', None)
-        self.ssh.upload_file_sudo(json.dumps(config, indent=2) + '\n', f"{self.REMOTE_DIR}/config.json")
+        self._upload_public_file(json.dumps(config, indent=2) + '\n', f"{self.REMOTE_DIR}/config.json")
 
-        self.ssh.upload_file_sudo(
+        self._upload_public_file(
             f"TPROXY_HOSTNAME={hostname}\nACME_EMAIL={acme_email}\n", f"{self.REMOTE_DIR}/.env")
 
         # Must exist before compose runs, or Docker would create a directory
@@ -437,14 +449,14 @@ chmod 600 {path}
         with open(os.path.join(self.LOCAL_ASSETS, 'backend', 'backend.toml'), encoding='utf-8') as fh:
             backend_toml = fh.read()
         self._upload_secret_file(backend_toml, f"{self.REMOTE_DIR}/backend/backend.toml",
-                                 owner=self.BACKEND_OWNER)
+                                 owner=BACKEND_OWNER)
 
         if site_mode == 'generated':
             results.append("Generating cover site...")
             site = generate_site(site_name or hostname.split('.')[0], site_tagline,
                                  seed=secrets.randbits(64))
             for rel, content in site.items():
-                self.ssh.upload_file_sudo(content, f"{self.REMOTE_DIR}/site/{rel}")
+                self._upload_public_file(content, f"{self.REMOTE_DIR}/site/{rel}")
 
         # Carry existing clients across a reinstall; re-render on the new files.
         for client in existing_clients:
@@ -506,7 +518,7 @@ chmod 600 {path}
             raise ValueError("Exactly one of public_dir or public_upstream must be set")
 
         previous = (self._read_json(f"{self.REMOTE_DIR}/config.json") or {}).get('public_hostname', '')
-        self.ssh.upload_file_sudo(json.dumps(config, indent=2) + '\n', f"{self.REMOTE_DIR}/config.json")
+        self._upload_public_file(json.dumps(config, indent=2) + '\n', f"{self.REMOTE_DIR}/config.json")
         if hostname != previous:
             # Caddy takes the domain from .env, not from config.json. Leaving it
             # behind means the relay expects one hostname while Caddy still holds
@@ -524,7 +536,7 @@ chmod 600 {path}
         for line in self._read_remote(f"{self.REMOTE_DIR}/.env").splitlines():
             if line.startswith('ACME_EMAIL='):
                 acme_email = line.split('=', 1)[1].strip()
-        self.ssh.upload_file_sudo(
+        self._upload_public_file(
             f"TPROXY_HOSTNAME={hostname}\nACME_EMAIL={acme_email}\n", f"{self.REMOTE_DIR}/.env")
 
     # ------------------------------------------------------------------

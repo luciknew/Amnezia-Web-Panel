@@ -471,7 +471,7 @@
             if (info.installed && (key !== 'awg' || info.container_running)) {
                 const opt = document.createElement('option');
                 opt.value = key;
-                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase())));
+                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : (key === 'webproxy' ? 'Telegram WEB Proxy' : key.toUpperCase()))));
                 if (key === "{{ settings.sync.remnawave_protocol }}") opt.selected = true;
                 protoSelect.appendChild(opt);
                 count++;

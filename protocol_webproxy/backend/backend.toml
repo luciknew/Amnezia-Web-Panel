@@ -1,0 +1,41 @@
+### MTProxy backend for the Telegram WEB proxy relay.
+# Loopback-only: clients never reach it directly, the relay dials it.
+# Ports differ from the panel's public telemt so both can run on one host.
+
+[general]
+use_middle_proxy = true
+log_level = "normal"
+
+# The WEB proxy carrier already provides TLS. Inside the tunnel the client
+# applies the plain MTProxy transform, so Fake-TLS must stay off; `secure`
+# covers dd-prefixed secrets, `classic` covers bare 16-byte ones.
+[general.modes]
+classic = true
+secure = true
+tls = false
+
+[general.links]
+show = "*"
+
+[server]
+port = 2398
+metrics_port = 9092
+metrics_listen = "127.0.0.1:9092"
+metrics_whitelist = ["127.0.0.1", "::1"]
+max_connections = 0
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:9093"
+whitelist = ["127.0.0.0/8"]
+minimal_runtime_enabled = false
+minimal_runtime_cache_ttl_ms = 1000
+
+[[server.listeners]]
+ip = "127.0.0.1"
+
+[censorship]
+mask = false
+tls_emulation = false
+
+[access.users]

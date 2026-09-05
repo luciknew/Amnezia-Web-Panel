@@ -117,10 +117,11 @@
                 document.getElementById('configText').textContent = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
 
-                // Telemt (MTProxy) doesn't have a "VPN Link" (vpn://) format in Amnezia
+                // Telemt (MTProxy) and the WEB proxy hand out a plain link, not
+                // an Amnezia vpn:// config, so there is no "VPN Link" tab.
                 const vpnTab = document.querySelectorAll('.config-tab')[1];
                 const vpnPanel = document.getElementById('panel-vpn');
-                if (proto === 'telemt') {
+                if (proto === 'telemt' || proto === 'webproxy') {
                     vpnTab.style.display = 'none';
                 } else {
                     vpnTab.style.display = '';

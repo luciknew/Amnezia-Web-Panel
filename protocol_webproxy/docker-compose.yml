@@ -1,0 +1,75 @@
+# Telegram WEB proxy stack. All three services share the host network namespace:
+# the relay validates that its backend is a *numeric loopback* address, so the
+# MTProxy behind it must answer on 127.0.0.1 as seen from the relay's netns.
+# This also reproduces upstream's reference layout exactly:
+#   Internet 80/443 -> Caddy -> 127.0.0.1:8080 relay -> 127.0.0.1:2398 MTProxy
+services:
+  # MTProxy backend. Loopback-only: it is never reached directly by clients,
+  # only through the relay. Ports differ from the panel's public telemt
+  # (9090/9091) so both can coexist on one host.
+  webproxy-mtp:
+    image: ghcr.io/telemt/telemt:latest
+    container_name: amnezia-webproxy-mtp
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app/conf
+    command: ["backend.toml"]
+    volumes:
+      - ./backend:/app/conf:rw
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=1m
+    environment:
+      - RUST_LOG=info
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  webproxy-relay:
+    build: .
+    image: amnezia-webproxy:pinned
+    container_name: amnezia-webproxy
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - webproxy-mtp
+    volumes:
+      - ./config.json:/etc/tproxy/config.json:ro
+      - ./profiles.json:/etc/tproxy/profiles.json:ro
+      # Persistent 32-byte HMAC key for session tokens; the relay refuses to
+      # start if it is missing, wrong-sized or group/other-readable.
+      - ./token.key:/etc/tproxy/token.key:ro
+      - ./site:/srv/tproxy-site:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Public TLS terminator. Needs NET_BIND_SERVICE for 80/443.
+  webproxy-caddy:
+    image: caddy:2-alpine
+    container_name: amnezia-webproxy-caddy
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - webproxy-relay
+    env_file:
+      - .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy_data:
+  caddy_config:

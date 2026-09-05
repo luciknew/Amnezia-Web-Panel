@@ -62,6 +62,12 @@ class BackupManager:
             remote_dir = inst_path('/opt/amnezia/telemt')
             paths['host'] = [remote_dir]
             paths['container'] = [remote_dir]
+        elif base == 'webproxy':
+            remote_dir = inst_path('/opt/amnezia/webproxy')
+            paths['host'] = [remote_dir]
+            # The relay container mounts its config read-only from the host
+            # dir above; there is nothing extra to pull out of the container.
+            paths['container'] = []
         elif base == 'dns':
             paths['host'] = ['/opt/amnezia/dns']
             paths['container'] = ['/opt/amnezia/dns']

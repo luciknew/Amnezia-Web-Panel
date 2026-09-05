@@ -1,0 +1,45 @@
+# Adapted from tproxy-server/deploy/Caddyfile.
+{
+	email {$ACME_EMAIL}
+	admin off
+	servers {
+		# HTTP/3 is off on purpose: it would claim UDP 443 and collide with an
+		# AmneziaWG 2.0 QUIC-mimicry listener on the same host.
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			# Maps to Go's ReadTimeout; must stay well above the relay's
+			# long_poll (25s) or parked polls get cut.
+			read_body 60s
+		}
+	}
+}
+
+{$TPROXY_HOSTNAME} {
+	# One backend serves the whole surface -- operator site, bridge page and
+	# API. Never route the site around the relay: the relay being the only
+	# gateway is what makes an active probe see an ordinary website.
+	encode zstd gzip
+	# -Via belongs in the outer header block: a header_down inside
+	# reverse_proxy runs before Caddy adds its own Via banner (HARDENING.md).
+	header {
+		-Via
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+	reverse_proxy 127.0.0.1:8080 {
+		transport http {
+			response_header_timeout 40s
+		}
+	}
+
+	# Backend down must look the same on every path.
+	# No shared policy bundle here: an identical CSP/Permissions-Policy set on
+	# every error was itself a relay signature. Site policies belong to the site.
+	handle_errors {
+		header {
+			Cache-Control "no-store"
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		}
+		respond "{http.error.status_code} {http.error.status_text}" {http.error.status_code}
+	}
+}

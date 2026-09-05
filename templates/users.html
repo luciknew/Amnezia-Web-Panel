@@ -677,7 +677,7 @@
             if (info.installed && (key !== 'awg' || info.container_running)) {
                 const opt = document.createElement('option');
                 opt.value = key;
-                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase())));
+                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : (key === 'webproxy' ? 'Telegram WEB Proxy' : key.toUpperCase()))));
                 select.appendChild(opt);
                 count++;
             }
@@ -940,7 +940,7 @@
                                 <div class="client-name">${c.name || 'Connection'}</div>
                                 <div class="client-meta">
                                     <span>🖥 ${c.server_name || ''}</span>
-                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())))}</span>
+                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : (c.protocol === 'webproxy' ? 'Telegram WEB Proxy' : c.protocol.toUpperCase()))))}</span>
                                 </div>
                             </div>
                         </div>
@@ -1115,6 +1115,7 @@
                     : c.protocol === 'awg2' ? 'AmneziaWG 2.0'
                     : c.protocol === 'awg_legacy' ? 'AWG Legacy'
                     : c.protocol === 'xray' ? 'Xray'
+                    : c.protocol === 'webproxy' ? 'Telegram WEB Proxy'
                     : c.protocol === 'telemt' ? 'Telemt'
                     : c.protocol.toUpperCase();
                 const server = c.server_name || '?';

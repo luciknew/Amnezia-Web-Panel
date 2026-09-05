@@ -189,6 +189,30 @@
         </div>
     </div>
 
+    <!-- Telegram WEB Proxy Card -->
+    <div class="card card-hover protocol-card protocol-webproxy" id="proto-webproxy">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon">🌐</div>
+            <div class="flex gap-sm" id="webproxy-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">Telegram WEB Proxy</div>
+        <div class="protocol-desc">
+            {{ _('webproxy_desc') }}
+        </div>
+        <div class="protocol-status" id="webproxy-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="webproxy-info" class="hidden">
+            <div class="protocol-info" id="webproxy-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="webproxy-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('webproxy')" id="webproxy-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+    </div>
+
     <!-- WireGuard Card -->
     <div class="card card-hover protocol-card protocol-wireguard" id="proto-wireguard">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
@@ -366,6 +390,7 @@
                 <option value="awg_legacy">AWG Legacy</option>
                 <option value="xray">Xray</option>
                 <option value="telemt">Telemt</option>
+                <option value="webproxy">Telegram WEB Proxy</option>
                 <option value="wireguard">WireGuard</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="openAddConnectionModal()">
@@ -423,6 +448,58 @@
                     <label class="form-label">{{ _('max_connections_limit') }}</label>
                     <input class="form-input" type="number" id="installTelemtMaxConns" value="0" min="0">
                     <div class="form-hint">{{ _('max_connections_hint') }}</div>
+                </div>
+            </div>
+
+            <div id="webproxyOptions"
+                style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_hostname') }}</label>
+                    <input class="form-input" type="text" id="installWebproxyHost" placeholder="tp.example.com">
+                    <div class="form-hint">{{ _('webproxy_hostname_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_acme_email') }}</label>
+                    <input class="form-input" type="email" id="installWebproxyEmail" placeholder="admin@example.com">
+                    <div class="form-hint">{{ _('webproxy_acme_email_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_carrier_mode') }}</label>
+                    <select class="form-input" id="installWebproxyCarrier">
+                        <option value="https">https</option>
+                        <option value="https-lanes">https-lanes</option>
+                        <option value="websocket">websocket</option>
+                        <option value="websocket-lanes">websocket-lanes</option>
+                    </select>
+                    <div class="form-hint">{{ _('webproxy_carrier_mode_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_site_mode') }}</label>
+                    <select class="form-input" id="installWebproxySiteMode"
+                        onchange="toggleWebproxySiteFields()">
+                        <option value="generated">{{ _('webproxy_site_generated') }}</option>
+                        <option value="upstream">{{ _('webproxy_site_upstream') }}</option>
+                    </select>
+                    <div class="form-hint">{{ _('webproxy_site_mode_hint') }}</div>
+                </div>
+                <div id="webproxySiteGeneratedFields">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_name') }}</label>
+                        <input class="form-input" type="text" id="installWebproxySiteName" placeholder="Vasnetsov Joinery">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_tagline') }}</label>
+                        <input class="form-input" type="text" id="installWebproxySiteTagline" placeholder="Small workshop">
+                    </div>
+                </div>
+                <div id="webproxySiteUpstreamFields" style="display:none;">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_upstream_url') }}</label>
+                        <input class="form-input" type="text" id="installWebproxyUpstream" placeholder="http://127.0.0.1:3000">
+                    </div>
+                </div>
+                <div class="form-hint" style="color:var(--warn, #b8860b); margin-top:var(--space-sm);">
+                    {{ _('webproxy_site_warning') }}
                 </div>
             </div>
 
@@ -563,6 +640,27 @@
                 <option value="{{ u.id }}">{{ u.username }} ({{ u.role }})</option>
                 {% endfor %}
             </select>
+        </div>
+
+        <div id="webproxyConnOptions"
+            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+            <div class="form-group">
+                <label class="form-label">{{ _('webproxy_secret') }}</label>
+                <input class="form-input" type="text" id="webproxySecret" placeholder="Optional (auto-generated if empty)">
+                <div class="form-hint">{{ _('webproxy_secret_hint') }}</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('webproxy_carrier_mode') }}</label>
+                <select class="form-input" id="webproxyCarrier">
+                    <option value="https">https</option>
+                    <option value="https-lanes">https-lanes</option>
+                    <option value="websocket">websocket</option>
+                    <option value="websocket-lanes">websocket-lanes</option>
+                </select>
+            </div>
+            <div class="form-hint" style="color:var(--warn, #b8860b);">
+                {{ _('webproxy_restart_warning') }}
+            </div>
         </div>
 
         <div id="telemtConnOptions"
@@ -759,6 +857,7 @@
             case 'awg_legacy': return 'AWG Legacy';
             case 'xray': return 'Xray';
             case 'telemt': return 'Telemt';
+            case 'webproxy': return 'Telegram WEB Proxy';
             case 'wireguard': return 'WireGuard';
             case 'dns': return 'AmneziaDNS';
             case 'socks5': return 'SOCKS5 Proxy';
@@ -815,7 +914,7 @@
 
                 for (const [proto, info] of Object.entries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
+                    const isVPN = ['awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'wireguard'].includes(proto);
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -856,7 +955,7 @@
     }
 
     function updateStatusCounts(protocols) {
-        const protos = ['awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
+        const protos = ['awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'wireguard'];
         const servs = ['dns', 'adguard', 'socks5'];
 
         let pRunning = 0, pTotal = protos.length;
@@ -930,7 +1029,10 @@
                 if (isService) {
                     grid = buildServiceInfoGrid(proto, info);
                 } else if (info.port) {
-                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${(proto === 'xray' || proto === 'telemt') ? 'TCP' : 'UDP'}</span></div>`;
+                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${(proto === 'xray' || proto === 'telemt' || proto === 'webproxy') ? 'TCP' : 'UDP'}</span></div>`;
+                    if (proto === 'webproxy' && info.hostname) {
+                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('webproxy_hostname')}</span><span class="protocol-info-value">${info.hostname}</span></div>`;
+                    }
                 }
                 if (!isService && info.clients_count !== undefined) {
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
@@ -1100,6 +1202,12 @@
         }
     }
 
+    function toggleWebproxySiteFields() {
+        const mode = document.getElementById('installWebproxySiteMode').value;
+        document.getElementById('webproxySiteGeneratedFields').style.display = mode === 'generated' ? '' : 'none';
+        document.getElementById('webproxySiteUpstreamFields').style.display = mode === 'upstream' ? '' : 'none';
+    }
+
     // ========== Protocol Installation ==========
     function openInstallModal(proto) {
         currentInstallProto = proto;
@@ -1110,10 +1218,12 @@
         const portLabel = document.getElementById('installPortLabel');
         const portHint = document.getElementById('installPortHint');
         const telemtOpts = document.getElementById('telemtOptions');
+        const webproxyOpts = document.getElementById('webproxyOptions');
         const socks5Opts = document.getElementById('socks5Options');
         const adguardOpts = document.getElementById('adguardOptions');
 
         telemtOpts.style.display = 'none';
+        webproxyOpts.style.display = 'none';
         socks5Opts.style.display = 'none';
         adguardOpts.style.display = 'none';
 
@@ -1133,6 +1243,15 @@
             portInput.disabled = false;
             portHint.textContent = _('telemt_port_hint');
             telemtOpts.style.display = 'block';
+        } else if (proto === 'webproxy') {
+            // 443 is fixed by the WEB proxy type: the client accepts a hostname
+            // and a secret, and no port at all.
+            portLabel.textContent = _('port') + ' (TCP)';
+            portInput.value = '443';
+            portInput.disabled = true;
+            portHint.textContent = _('webproxy_port_hint');
+            webproxyOpts.style.display = 'block';
+            toggleWebproxySiteFields();
         } else if (proto === 'socks5') {
             portLabel.textContent = _('port') + ' (TCP)';
             portInput.value = '38080';
@@ -1196,6 +1315,14 @@
                 params.tls_emulation = document.getElementById('installTelemtTls').checked;
                 params.tls_domain = document.getElementById('installTelemtDomain').value;
                 params.max_connections = parseInt(document.getElementById('installTelemtMaxConns').value) || 0;
+            } else if (currentInstallProto === 'webproxy') {
+                params.webproxy_hostname = document.getElementById('installWebproxyHost').value.trim();
+                params.webproxy_acme_email = document.getElementById('installWebproxyEmail').value.trim();
+                params.webproxy_carrier_mode = document.getElementById('installWebproxyCarrier').value;
+                params.webproxy_site_mode = document.getElementById('installWebproxySiteMode').value;
+                params.webproxy_site_name = document.getElementById('installWebproxySiteName').value.trim();
+                params.webproxy_site_tagline = document.getElementById('installWebproxySiteTagline').value.trim();
+                params.webproxy_site_upstream = document.getElementById('installWebproxyUpstream').value.trim();
             } else if (currentInstallProto === 'socks5') {
                 params.socks5_username = document.getElementById('installSocks5User').value || 'proxy_user';
                 params.socks5_password = document.getElementById('installSocks5Pass').value || '';
@@ -1417,7 +1544,7 @@
                 const sent = userData.dataSent || '';
                 const initial = name.charAt(0).toUpperCase();
                 const enabled = (client.enabled !== undefined) ? client.enabled : (userData.enabled !== false);
-                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt';
+                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || proto === 'webproxy';
                 const assignedUser = client.assigned_user || '';
 
                 let metaHtml = '';
@@ -1455,8 +1582,8 @@
                             </div>
                         </div>
                         <div class="client-actions">
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt'})" title="${_('config')}">📄</button>
-                            ${proto === 'telemt' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || proto === 'webproxy'})" title="${_('config')}">📄</button>
+                            ${(proto === 'telemt' || proto === 'webproxy') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled})" title="${toggleTitle}">${toggleIcon}</button>
                             <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">🗑</button>
                         </div>
@@ -1483,6 +1610,10 @@
             const params = {
                 protocol: proto, name: connName, user_id: userId,
             };
+            if (proto === 'webproxy') {
+                params.webproxy_secret = document.getElementById('webproxySecret').value || null;
+                params.webproxy_carrier_mode = document.getElementById('webproxyCarrier').value || null;
+            }
             if (proto === 'telemt') {
                 params.telemt_quota = document.getElementById('telemtQuota').value || null;
                 params.telemt_max_ips = parseInt(document.getElementById('telemtMaxIps').value) || null;
@@ -1490,8 +1621,9 @@
                 params.telemt_secret = document.getElementById('telemtSecret').value || null;
                 params.telemt_ad_tag = document.getElementById('telemtAdTag').value || null;
                 params.telemt_max_conns = parseInt(document.getElementById('telemtMaxConns').value) || null;
-                if (isEditingConn) params.client_id = editingClientId;
             }
+            // Applies to every editable protocol, not just telemt.
+            if (isEditingConn) params.client_id = editingClientId;
             const result = await apiCall(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, 'POST', params);
             if (isEditingConn) {
                 showToast('Подключение обновлено', 'success');
@@ -1507,8 +1639,8 @@
                     document.getElementById('configModalTitle').textContent = `Конфигурация — ${connName}`;
                     document.getElementById('configText').textContent = result.config;
                     document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                    document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-                    document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+                    document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
+                    document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
                     switchConfigTab('conf');
                     openModal('configModal');
                     generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
@@ -1530,11 +1662,24 @@
     function openAddConnectionModal(isEdit = false, clientData = null) {
         isEditingConn = isEdit;
         const proto = document.getElementById('connProtoSelect').value;
+        const webproxyOpts = document.getElementById('webproxyConnOptions');
+        if (webproxyOpts) webproxyOpts.style.display = (proto === 'webproxy') ? 'block' : 'none';
         const telemtOpts = document.getElementById('telemtConnOptions');
 
         document.getElementById('addConnectionModalTitle').textContent = isEdit ? 'Редактировать подключение' : 'Добавить подключение';
         document.getElementById('addConnBtnText').textContent = isEdit ? 'Сохранить' : 'Создать';
         document.getElementById('connectionNameGroup').style.display = isEdit ? 'none' : 'block';
+
+        if (proto === 'webproxy') {
+            if (isEdit && clientData) {
+                editingClientId = clientData.clientName;
+                document.getElementById('webproxySecret').value = clientData.token || '';
+                document.getElementById('webproxyCarrier').value = clientData.carrier_mode || 'https';
+            } else {
+                document.getElementById('webproxySecret').value = '';
+                document.getElementById('webproxyCarrier').value = 'https';
+            }
+        }
 
         if (proto === 'telemt') {
             telemtOpts.style.display = 'block';
@@ -1586,9 +1731,9 @@
         const proto = document.getElementById('connProtoSelect').value;
 
         // Restore tabs visibility first
-        document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
+        document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
         document.getElementById('panel-qr').style.display = '';
-        document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+        document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
         document.querySelectorAll('.config-tab')[2].style.display = '';
 
         // Client was created via native Amnezia app — private key is not stored server-side

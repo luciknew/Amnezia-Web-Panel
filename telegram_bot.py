@@ -305,6 +305,12 @@ async def _handle_get_config(
             elif proto == "telemt":
                 mgr = TelemtManager(ssh)
                 cfg = mgr.get_client_config(proto, conn["client_id"], server["host"], port)
+            elif proto == "webproxy":
+                from managers.webproxy_manager import WebProxyManager
+                mgr = WebProxyManager(ssh)
+                # host/port are ignored there: the link carries the relay's own
+                # public hostname and always port 443.
+                cfg = mgr.get_client_config(proto, conn["client_id"], server["host"], port)
             else:
                 # awg, awg2, awg_legacy
                 mgr = AWGManager(ssh)
@@ -336,7 +342,7 @@ async def _handle_get_config(
 
         # ------- 2. Send config (format depends on protocol) -------
         # Protocols that return a link/URI rather than an INI-style config file
-        is_link_proto = proto in ("xray", "telemt")
+        is_link_proto = proto in ("xray", "telemt", "webproxy")
 
         if is_link_proto:
             # Show as a tappable link — no .conf file needed

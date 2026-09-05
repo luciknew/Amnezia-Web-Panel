@@ -229,6 +229,9 @@ def get_protocol_manager(ssh, protocol: str):
     elif protocol == 'telemt':
         from managers.telemt_manager import TelemtManager
         return TelemtManager(ssh)
+    elif protocol == 'webproxy':
+        from managers.webproxy_manager import WebProxyManager
+        return WebProxyManager(ssh)
     elif protocol == 'dns':
         from managers.dns_manager import DNSManager
         return DNSManager(ssh)
@@ -425,6 +428,10 @@ def generate_vpn_link(config_text, protocol: str = ''):
     """
     if not config_text:
         return ''
+    if protocol == 'webproxy':
+        # Already a real https://t.me/webproxy?... link — wrapping it in
+        # vpn://base64 would only hide it from every scanner.
+        return config_text.strip()
     if protocol == 'awg':
         try:
             return _build_amnezia_awg_link(config_text, 'amnezia-awg')
@@ -885,6 +892,16 @@ class InstallProtocolRequest(BaseModel):
     tls_emulation: Optional[bool] = None
     tls_domain: Optional[str] = None
     max_connections: Optional[int] = None
+    # Telegram WEB proxy
+    webproxy_hostname: Optional[str] = None
+    webproxy_acme_email: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
+    webproxy_site_mode: Optional[str] = None
+    webproxy_site_name: Optional[str] = None
+    webproxy_site_tagline: Optional[str] = None
+    webproxy_site_upstream: Optional[str] = None
+    webproxy_max_profiles: Optional[int] = None
+    webproxy_skip_preflight: Optional[bool] = None
     # SOCKS5
     socks5_username: Optional[str] = None
     socks5_password: Optional[str] = None
@@ -924,6 +941,8 @@ class AddConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class EditConnectionRequest(BaseModel):
@@ -935,6 +954,8 @@ class EditConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class ConnectionActionRequest(BaseModel):
@@ -967,6 +988,8 @@ class AddUserRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 
@@ -1069,6 +1092,8 @@ class AddUserConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class CreateApiTokenRequest(BaseModel):
@@ -2025,8 +2050,8 @@ async def api_check_server(request: Request, server_id: int):
             except Exception as e:
                 return proto, None, str(e)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'dns', 'wireguard', 'socks5', 'adguard']]
             for future in concurrent.futures.as_completed(futures):
                 proto, result, err = future.result()
                 if err:
@@ -2064,7 +2089,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']:
+        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'dns', 'wireguard', 'socks5', 'adguard']:
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
 
         server = data['servers'][server_id]
@@ -2080,6 +2105,19 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
                 tls_domain=req.tls_domain,
                 max_connections=req.max_connections if req.max_connections is not None else 0
+            )
+        elif req.protocol == 'webproxy':
+            result = manager.install_protocol(
+                protocol_type='webproxy',
+                hostname=req.webproxy_hostname or '',
+                acme_email=req.webproxy_acme_email or '',
+                carrier_mode=req.webproxy_carrier_mode or 'https',
+                site_mode=req.webproxy_site_mode or 'generated',
+                site_name=req.webproxy_site_name or '',
+                site_tagline=req.webproxy_site_tagline or '',
+                site_upstream=req.webproxy_site_upstream or '',
+                max_profiles=req.webproxy_max_profiles or 128,
+                skip_preflight=bool(req.webproxy_skip_preflight),
             )
         elif req.protocol == 'xray':
             result = manager.install_protocol(port=req.port)
@@ -2205,12 +2243,20 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+# Protocols whose "container" is really a stack: start/stop must move all of
+# them together, or the WEB proxy is left half-up (Caddy serving errors on
+# every path while the relay is down).
+STACK_CONTAINERS = {
+    'webproxy': ['amnezia-webproxy-caddy', 'amnezia-webproxy', 'amnezia-webproxy-mtp'],
+}
+
 CONTAINER_NAMES = {
     'awg': 'amnezia-awg',
     'awg2': 'amnezia-awg2',
     'awg_legacy': 'amnezia-awg-legacy',
     'xray': 'amnezia-xray',
     'telemt': 'telemt',
+    'webproxy': 'amnezia-webproxy',
     'dns': 'amnezia-dns',
     'wireguard': 'amnezia-wireguard',
     'socks5': 'amnezia-socks5proxy',
@@ -2355,11 +2401,16 @@ async def api_container_toggle(request: Request, server_id: int, req: ProtocolRe
             f"docker inspect -f '{{{{.State.Running}}}}' {container} 2>/dev/null"
         )
         is_running = out.strip().lower() == 'true'
+        # Stop the front first and start it last, so the hostname never answers
+        # while its backend is missing.
+        stack = STACK_CONTAINERS.get(req.protocol, [container])
         if is_running:
-            ssh.run_sudo_command(f"docker stop {container}")
+            for name in stack:
+                ssh.run_sudo_command(f"docker stop {name}")
             action = 'stopped'
         else:
-            ssh.run_sudo_command(f"docker start {container}")
+            for name in reversed(stack):
+                ssh.run_sudo_command(f"docker start {name}")
             action = 'started'
         ssh.disconnect()
         return {'status': 'success', 'action': action, 'container': container}
@@ -2389,6 +2440,10 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         elif req.protocol == 'telemt':
             from managers.telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
+            config = mgr._get_server_config()
+        elif req.protocol == 'webproxy':
+            from managers.webproxy_manager import WebProxyManager
+            mgr = WebProxyManager(ssh)
             config = mgr._get_server_config()
         elif req.protocol == 'wireguard':
             from managers.wireguard_manager import WireGuardManager
@@ -2429,6 +2484,10 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
         elif req.protocol == 'telemt':
             from managers.telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
+            mgr.save_server_config(req.protocol, req.config)
+        elif req.protocol == 'webproxy':
+            from managers.webproxy_manager import WebProxyManager
+            mgr = WebProxyManager(ssh)
             mgr.save_server_config(req.protocol, req.config)
         elif req.protocol == 'wireguard':
             from managers.wireguard_manager import WireGuardManager
@@ -2514,6 +2573,12 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
                 user_ad_tag=req.telemt_ad_tag,
                 max_tcp_conns=req.telemt_max_conns
             )
+        elif req.protocol == 'webproxy':
+            result = manager.add_client(
+                req.protocol, req.name, get_client_host(server), port,
+                secret=req.webproxy_secret,
+                carrier_mode=req.webproxy_carrier_mode,
+            )
         elif req.protocol == 'wireguard':
             result = manager.add_client(req.name, get_client_host(server))
         else:
@@ -2594,7 +2659,10 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             edit_params['secret'] = req.telemt_secret
             edit_params['user_ad_tag'] = req.telemt_ad_tag
             edit_params['max_tcp_conns'] = req.telemt_max_conns
-            
+        elif req.protocol == 'webproxy':
+            edit_params['secret'] = req.webproxy_secret
+            edit_params['carrier_mode'] = req.webproxy_carrier_mode
+
         result = manager.edit_client(req.protocol, req.client_id, edit_params)
         ssh.disconnect()
         return result
@@ -2788,6 +2856,12 @@ async def api_add_user(request: Request, req: AddUserRequest):
                         user_ad_tag=req.telemt_ad_tag,
                         max_tcp_conns=req.telemt_max_conns
                     )
+                elif req.protocol == 'webproxy':
+                    conn_result = manager.add_client(
+                        req.protocol, conn_name, get_client_host(server), port,
+                        secret=req.webproxy_secret,
+                        carrier_mode=req.webproxy_carrier_mode,
+                    )
                 else:
                     conn_result = manager.add_client(req.protocol, conn_name, get_client_host(server), port)
                 ssh.disconnect()
@@ -2929,6 +3003,12 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                     secret=req.telemt_secret,
                     user_ad_tag=req.telemt_ad_tag,
                     max_tcp_conns=req.telemt_max_conns
+                )
+            elif req.protocol == 'webproxy':
+                result = await asyncio.to_thread(
+                    manager.add_client, req.protocol, req.name, get_client_host(server), port,
+                    secret=req.webproxy_secret,
+                    carrier_mode=req.webproxy_carrier_mode,
                 )
             else:
                 result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, get_client_host(server), port)
@@ -3101,10 +3181,11 @@ def _build_email_body_html(panel_user: dict, payloads: List[dict], custom_messag
         proto_label = {
             'awg': 'AmneziaWG', 'awg2': 'AmneziaWG 2.0', 'awg_legacy': 'AmneziaWG Legacy',
             'wireguard': 'WireGuard', 'xray': 'Xray', 'telemt': 'Telemt (Telegram)',
+            'webproxy': 'Telegram WEB Proxy',
         }.get(proto, proto)
         server_label = server.get('name') or server.get('host') or '?'
         link_block = ''
-        if proto in ('xray', 'telemt'):
+        if proto in ('xray', 'telemt', 'webproxy'):
             if p['config']:
                 link_block = (
                     f'<div style="margin:8px 0 4px; font-size:12px; color:#666;">Link:</div>'
@@ -3178,7 +3259,7 @@ def _build_email_body(panel_user: dict, payloads: List[dict], custom_message: st
         lines.append(f"{i}. {conn.get('name') or 'connection'}")
         lines.append(f"   Server: {server_label}")
         lines.append(f"   Protocol: {proto}")
-        if proto in ('xray', 'telemt'):
+        if proto in ('xray', 'telemt', 'webproxy'):
             # URI-style protocols: the config IS the link, paste it into the app.
             if p['config']:
                 lines.append(f"   Link: {p['config']}")

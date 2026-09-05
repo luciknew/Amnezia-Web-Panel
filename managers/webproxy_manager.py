@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import uuid
 from datetime import datetime, timezone
 
@@ -302,14 +303,32 @@ chmod 600 {path}
     # install / uninstall
     # ------------------------------------------------------------------
 
+    def _resolve_a_records(self, hostname):
+        """Resolve the hostname's A records from the panel, not from the target.
+
+        `getent` on the server consults /etc/hosts first, and Ubuntu keeps a
+        `127.0.1.1 <fqdn>` line for the machine's own name. On a server whose
+        hostname *is* the proxy domain that answers loopback, and a perfectly
+        good A record looks like a mismatch. Falls back to the server's own
+        resolver (minus loopback) if the panel itself cannot resolve.
+        """
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+            addresses = sorted({i[4][0] for i in infos})
+        except socket.gaierror:
+            addresses = []
+        if not addresses:
+            out, _, _ = self.ssh.run_command(
+                f"getent ahostsv4 {hostname} 2>/dev/null | awk '{{print $1}}' | sort -u")
+            addresses = sorted(set(out.split()))
+        return [a for a in addresses if not a.startswith('127.')]
+
     def _preflight(self, hostname, skip_ports=False):
         """Fail in the panel rather than leave Caddy looping on a doomed ACME
         order or the stack fighting another service for 443."""
         problems = []
 
-        resolved, _, _ = self.ssh.run_command(
-            f"getent ahostsv4 {hostname} 2>/dev/null | awk '{{print $1}}' | sort -u")
-        addresses = [a for a in resolved.split() if a]
+        addresses = self._resolve_a_records(hostname)
         public_ip, _, _ = self.ssh.run_command(
             "curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true")
         public_ip = public_ip.strip()

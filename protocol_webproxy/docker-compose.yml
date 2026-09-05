@@ -23,7 +23,7 @@ services:
     cap_drop:
       - ALL
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges=true
     ulimits:
       nofile:
         soft: 65536
@@ -47,7 +47,7 @@ services:
     cap_drop:
       - ALL
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges=true
 
   # Public TLS terminator. Needs NET_BIND_SERVICE for 80/443.
   webproxy-caddy:
@@ -68,7 +68,7 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges=true
 
 volumes:
   caddy_data:

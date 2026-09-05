@@ -429,8 +429,8 @@ def generate_vpn_link(config_text, protocol: str = ''):
     if not config_text:
         return ''
     if protocol == 'webproxy':
-        # Already a real https://t.me/webproxy?... link — wrapping it in
-        # vpn://base64 would only hide it from every scanner.
+        # Already a tg://webproxy?... deep link the client resolves itself —
+        # wrapping it in vpn://base64 would only hide it from every scanner.
         return config_text.strip()
     if protocol == 'awg':
         try:

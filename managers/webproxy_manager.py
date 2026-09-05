@@ -560,14 +560,14 @@ chmod 600 {path}
             'created': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         })
         self._apply_clients(clients)
-        link = self._build_link(secret)
         # `client_id` (not `clientId`) is the key app.py looks for when linking
         # a fresh connection to a panel user -- match the other managers.
         return {
             'client_id': client_name,
             'secret': secret,
-            'config': link,
-            'vpn_link': link,
+            'hostname': self._public_hostname(),
+            'config': self._build_link(secret),
+            'vpn_link': self._build_share_link(secret),
         }
 
     def edit_client(self, protocol_type, client_id, new_params):
@@ -591,9 +591,10 @@ chmod 600 {path}
             target['name'] = renamed
 
         self._apply_clients(clients)
-        link = self._build_link(target['secret'])
         return {'status': 'success', 'client_id': target['name'],
-                'config': link, 'vpn_link': link}
+                'hostname': self._public_hostname(),
+                'config': self._build_link(target['secret']),
+                'vpn_link': self._build_share_link(target['secret'])}
 
     def remove_client(self, protocol_type, client_id):
         clients = self._load_clients()
@@ -622,7 +623,25 @@ chmod 600 {path}
         return self._build_link(target['secret'])
 
     def _build_link(self, secret):
-        hostname = (self._read_json(f"{self.REMOTE_DIR}/config.json") or {}).get('public_hostname', '')
+        """Primary link: the `tg://` form the client resolves on its own.
+
+        The documented `https://t.me/webproxy?...` wrapper is not usable yet --
+        README says the public t.me frontend does not register that route, so it
+        only works once Telegram ships it (and needs t.me to be reachable at
+        all). The tg:// deep link never touches the network, and the values a
+        client actually asks for are just hostname + secret.
+        """
+        hostname = self._public_hostname()
+        if not hostname:
+            return ""
+        return f"tg://webproxy?server={hostname}&secret={secret}"
+
+    def _build_share_link(self, secret):
+        """The t.me wrapper, kept for when Telegram registers the route."""
+        hostname = self._public_hostname()
         if not hostname:
             return ""
         return f"https://t.me/webproxy?server={hostname}&secret={secret}"
+
+    def _public_hostname(self):
+        return (self._read_json(f"{self.REMOTE_DIR}/config.json") or {}).get('public_hostname', '')

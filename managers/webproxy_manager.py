@@ -126,17 +126,22 @@ class WebProxyManager:
     # state
     # ------------------------------------------------------------------
 
+    # Every docker call goes through sudo on purpose: the panel may log in as an
+    # ordinary user that is not in the `docker` group, and a plain `docker ps`
+    # then fails with "permission denied ... /var/run/docker.sock" -- which
+    # reads as "protocol not installed" and makes a reinstall re-run the
+    # port pre-flight against our own Caddy.
     def check_docker_installed(self):
-        out, _, _ = self.ssh.run_command("docker --version 2>/dev/null")
+        out, _, _ = self.ssh.run_sudo_command("docker --version 2>/dev/null")
         return bool(out.strip())
 
     def check_protocol_installed(self):
-        out, _, _ = self.ssh.run_command(
+        out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Names}}}}'")
         return out.strip() == self.CONTAINER_NAME
 
     def _container_running(self, name):
-        out, _, _ = self.ssh.run_command(f"docker inspect -f '{{{{.State.Running}}}}' {name} 2>/dev/null")
+        out, _, _ = self.ssh.run_sudo_command(f"docker inspect -f '{{{{.State.Running}}}}' {name} 2>/dev/null")
         return out.strip().lower() == 'true'
 
     def get_server_status(self, protocol_type='webproxy'):
@@ -371,7 +376,7 @@ chmod 600 {path}
             busy, _, _ = self.ssh.run_command(
                 f"ss -ltnH 'sport = :{port}' 2>/dev/null | head -1")
             if busy.strip():
-                owner, _, _ = self.ssh.run_command(
+                owner, _, _ = self.ssh.run_sudo_command(
                     f"docker ps --filter publish={port} --format '{{{{.Names}}}}' 2>/dev/null")
                 owner = owner.strip()
                 detail = f" (in use by container {owner})" if owner else ""

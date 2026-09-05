@@ -2050,7 +2050,10 @@ async def api_check_server(request: Request, server_id: int):
             except Exception as e:
                 return proto, None, str(e)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Kept below sshd's default MaxSessions (10): every probe opens its own
+        # exec channel on the one connection, and going wider makes the server
+        # refuse channels ("Secsh channel N open FAILED") for random protocols.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'dns', 'wireguard', 'socks5', 'adguard']]
             for future in concurrent.futures.as_completed(futures):
                 proto, result, err = future.result()

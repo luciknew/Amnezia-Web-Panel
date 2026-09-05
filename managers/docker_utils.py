@@ -53,7 +53,9 @@ def ensure_docker_compose(ssh):
     `apt-get install docker-compose-plugin` fails. So we add the repo,
     refresh package lists, then install.
     """
-    out, _, code = ssh.run_command("docker compose version 2>/dev/null")
+    # sudo: a non-root panel user is usually not in the `docker` group, and a
+    # bare probe would fail on the socket and reinstall the plugin every time.
+    out, _, code = ssh.run_sudo_command("docker compose version 2>/dev/null")
     if code == 0 and out.strip():
         return
 

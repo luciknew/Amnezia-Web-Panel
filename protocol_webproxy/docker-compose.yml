@@ -14,6 +14,15 @@ services:
     network_mode: host
     working_dir: /app/conf
     command: ["backend.toml"]
+    # The image's own healthcheck hardcodes /app/config.toml, which does not
+    # exist here -- without this override the container is always "unhealthy"
+    # and a real failure would be indistinguishable from that noise.
+    healthcheck:
+      test: ["CMD", "/app/telemt", "healthcheck", "/app/conf/backend.toml", "--mode", "liveness"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     volumes:
       - ./backend:/app/conf:rw
     tmpfs:

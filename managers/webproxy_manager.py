@@ -45,6 +45,9 @@ class WebProxyManager:
     REMOTE_DIR = "/opt/amnezia/webproxy"
     ADMIN_URL = "http://127.0.0.1:8081"
     BACKEND_ADDR = "127.0.0.1:2398"
+    # ghcr.io/telemt/telemt runs as nonroot:nonroot (uid/gid 65532), so its
+    # config has to be owned by that uid to stay readable at 0600.
+    BACKEND_OWNER = "65532:65532"
     LOCAL_ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'protocol_webproxy')
 
     def __init__(self, ssh_manager: SSHManager):
@@ -196,10 +199,18 @@ class WebProxyManager:
             logger.warning("Malformed JSON at %s on %s", path, getattr(self.ssh, 'host', '?'))
             return None
 
-    def _upload_secret_file(self, content, path):
+    def _upload_secret_file(self, content, path, owner=None):
         """Upload, then tighten perms: loadProfiles refuses a profiles file
-        that is readable or writable by group or others."""
+        that is readable or writable by group or others.
+
+        `owner` exists for the MTProxy backend config: that image runs as
+        `nonroot`, so a root-owned 0600 file is unreadable inside the container
+        and it just crash-loops with exit 1. The relay's own files need no
+        chown -- its image runs as root.
+        """
         self.ssh.upload_file_sudo(content, path)
+        if owner:
+            self.ssh.run_sudo_command(f"chown {owner} {path}")
         self.ssh.run_sudo_command(f"chmod 600 {path}")
 
     def _ensure_token_key(self):
@@ -286,7 +297,8 @@ chmod 600 {path}
         backend_path = f"{self.REMOTE_DIR}/backend/backend.toml"
         backend_toml = self._read_remote(backend_path)
         if backend_toml.strip():
-            self._upload_secret_file(self._render_backend_users(clients, backend_toml), backend_path)
+            self._upload_secret_file(self._render_backend_users(clients, backend_toml), backend_path,
+                                     owner=self.BACKEND_OWNER)
 
         if restart:
             self.restart()
@@ -393,6 +405,10 @@ chmod 600 {path}
         results.append("Uploading WEB proxy files...")
         self.ssh.run_sudo_command(f"mkdir -p {self.REMOTE_DIR}/backend {self.REMOTE_DIR}/site")
         self.ssh.run_sudo_command(f"chmod 755 {self.REMOTE_DIR}")
+        # The backend mounts this directory as its working dir and caches
+        # proxy-secret and its state files there; as root it only gets
+        # "Permission denied (non-fatal)" and re-downloads on every start.
+        self.ssh.run_sudo_command(f"chown {self.BACKEND_OWNER} {self.REMOTE_DIR}/backend")
 
         for name in ('Dockerfile', 'docker-compose.yml', 'Caddyfile'):
             with open(os.path.join(self.LOCAL_ASSETS, name), encoding='utf-8') as fh:
@@ -420,7 +436,8 @@ chmod 600 {path}
 
         with open(os.path.join(self.LOCAL_ASSETS, 'backend', 'backend.toml'), encoding='utf-8') as fh:
             backend_toml = fh.read()
-        self._upload_secret_file(backend_toml, f"{self.REMOTE_DIR}/backend/backend.toml")
+        self._upload_secret_file(backend_toml, f"{self.REMOTE_DIR}/backend/backend.toml",
+                                 owner=self.BACKEND_OWNER)
 
         if site_mode == 'generated':
             results.append("Generating cover site...")

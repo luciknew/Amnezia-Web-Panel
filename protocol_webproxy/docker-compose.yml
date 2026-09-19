@@ -10,6 +10,11 @@ services:
   webproxy-mtp:
     image: ghcr.io/telemt/telemt:latest
     container_name: amnezia-webproxy-mtp
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     restart: unless-stopped
     network_mode: host
     working_dir: /app/conf
@@ -42,6 +47,11 @@ services:
     build: .
     image: amnezia-webproxy:pinned
     container_name: amnezia-webproxy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     restart: unless-stopped
     network_mode: host
     depends_on:
@@ -62,6 +72,11 @@ services:
   webproxy-caddy:
     image: caddy:2-alpine
     container_name: amnezia-webproxy-caddy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     restart: unless-stopped
     network_mode: host
     depends_on:

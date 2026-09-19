@@ -191,7 +191,20 @@ def load_data():
         'host': '', 'port': 587, 'username': '', 'password': '',
         'from_email': '', 'from_name': '', 'encryption': 'starttls',
     })
+    # Stable server uid: `server_id` is just the list index and shifts on
+    # reorder/delete, so external systems (Vovka) keep the uid instead.
+    # Servers without one get a value derived from their SSH endpoint — the
+    # same on every load, no write here (concurrent loads can't disagree);
+    # the startup migration persists it.
+    for srv in data['servers']:
+        if not srv.get('uid'):
+            srv['uid'] = _derived_server_uid(srv)
     return data
+
+
+def _derived_server_uid(srv: dict) -> str:
+    key = f"{srv.get('host', '')}:{srv.get('ssh_port', 22)}:{srv.get('username', '')}"
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]
 
 
 def save_data(data):
@@ -1115,6 +1128,14 @@ class ShareAuthRequest(BaseModel):
 async def startup():
     data = load_data()
     changed = False
+    # Persist server uids that load_data derived for pre-uid installs
+    raw_servers = []
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            raw_servers = json.load(f).get('servers') or []
+    if any(not s.get('uid') for s in raw_servers):
+        changed = True
+        logger.info("Assigned stable uids to servers")
     if not data.get('users'):
         data['users'] = [{
             'id': str(uuid.uuid4()),
@@ -1692,6 +1713,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
             return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
 
         server = {
+            'uid': uuid.uuid4().hex,
             'name': name, 'host': host,
             'client_host': (req.client_host or '').strip(),
             'description': (req.description or '').strip(),
@@ -1772,10 +1794,12 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
 
 
 @app.get('/api/external/servers', tags=["External"])
-async def api_external_servers(request: Request):
+async def api_external_servers(request: Request, all_servers: bool = Query(default=False, alias='all')):
     """Server list filtered for external bots.
 
-    Only servers with `allow_vovka = True` are returned, and the response
+    Only servers with `allow_vovka = True` are returned (`?all=1` — every
+    server, with the `allow_vovka` flag: Vovka also issues proxies from
+    per-company servers that are not in its common pool), and the response
     deliberately omits SSH credentials and any other field a third-party
     bot has no business knowing. Use a Bearer API token (Settings → API
     Tokens in the admin UI) — admin-equivalent rights, same auth path as
@@ -1791,7 +1815,7 @@ async def api_external_servers(request: Request):
     data = load_data()
     out = []
     for idx, srv in enumerate(data.get('servers', []) or []):
-        if not srv.get('allow_vovka'):
+        if not all_servers and not srv.get('allow_vovka'):
             continue
         # Only protocols actually deployed — saves the caller from filtering
         # later and avoids leaking which extras were tried-and-removed.
@@ -1801,6 +1825,7 @@ async def api_external_servers(request: Request):
         ]
         out.append({
             'id': idx,
+            'uid': srv.get('uid') or '',
             'name': srv.get('name') or srv.get('host') or '',
             'host': srv.get('host') or '',
             'client_host': srv.get('client_host') or '',
@@ -1808,8 +1833,58 @@ async def api_external_servers(request: Request):
             'country_code': srv.get('country_code') or '',
             'country_name': srv.get('country_name') or '',
             'protocols': installed,
+            'allow_vovka': bool(srv.get('allow_vovka')),
         })
     return {'servers': out}
+
+
+# Telegram proxies Vovka tracks; other protocols are not its business
+EXTERNAL_PROXY_PROTOCOLS = ('telemt', 'webproxy')
+
+
+@app.get('/api/external/proxies', tags=["External"])
+async def api_external_proxies(request: Request):
+    """Every Telegram proxy (telemt / webproxy) assigned to a panel user, in one call.
+
+    Vovka syncs its registry against this: the panel is the source of truth.
+    Only connections bound to a user (user_connections) are returned; no
+    secrets, links or SSH data. `server_uid` is stable, `server_id` is the
+    current list index (it shifts when servers are reordered or deleted).
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    data = load_data()
+    servers = data.get('servers', []) or []
+    conns = []
+    user_ids = set()
+    for c in data.get('user_connections', []) or []:
+        if c.get('protocol') not in EXTERNAL_PROXY_PROTOCOLS:
+            continue
+        sid = c.get('server_id')
+        srv = servers[sid] if isinstance(sid, int) and 0 <= sid < len(servers) else {}
+        conns.append({
+            'id': c.get('id'),
+            'user_id': c.get('user_id'),
+            'protocol': c.get('protocol'),
+            'client_id': c.get('client_id'),
+            'name': c.get('name') or '',
+            'created_at': c.get('created_at') or '',
+            'server_id': sid,
+            'server_uid': srv.get('uid') or '',
+            'server_name': srv.get('name') or srv.get('host') or '',
+        })
+        user_ids.add(c.get('user_id'))
+    users = [{
+        'id': u['id'],
+        'username': u.get('username') or '',
+        'telegramId': u.get('telegramId'),
+        'email': u.get('email'),
+        'description': u.get('description'),
+        'enabled': u.get('enabled', True),
+        'created_at': u.get('created_at') or '',
+    } for u in data.get('users', []) or [] if u.get('id') in user_ids]
+    return {'users': users, 'connections': conns}
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])

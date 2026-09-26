@@ -15,14 +15,19 @@ logger = logging.getLogger(__name__)
 #  Global state
 # ----------------------------------------------------------------------- #
 _bot_task: Optional[asyncio.Task] = None
+# Optional save callback: used to auto-resolve @username links to numeric IDs
+# on first /start (so admins can paste a username and the bot finishes the wiring).
+_save_data_fn: Optional[Callable] = None
 
 
 def is_running() -> bool:
     return _bot_task is not None and not _bot_task.done()
 
 
-def launch_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Callable):
-    global _bot_task
+def launch_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Callable,
+               save_data_fn: Optional[Callable] = None):
+    global _bot_task, _save_data_fn
+    _save_data_fn = save_data_fn
     _bot_task = asyncio.create_task(
         _run_bot(token, load_data_fn, generate_vpn_link_fn),
         name="telegram_bot",
@@ -92,13 +97,47 @@ class TelegramAPI:
 # ----------------------------------------------------------------------- #
 #  Helpers
 # ----------------------------------------------------------------------- #
-def _find_user(load_data_fn: Callable, tg_id: str):
+def _find_user(load_data_fn: Callable, tg_id: str, tg_username: Optional[str] = None):
+    """Resolve panel user by Telegram identity.
+
+    Pass 1: match by numeric Telegram ID (the only stable identifier).
+    Pass 2: if not found and a username came in the update, match against any
+            stored value that looks like a username (non-numeric). On match
+            we rewrite the record's telegramId to the numeric id and persist —
+            so admins can paste a @username up front and the bot finishes the
+            wiring on first /start. The numeric id is then used for every
+            subsequent call (immune to nick renames)."""
     data = load_data_fn()
-    tg_id_clean = str(tg_id).lstrip("@")
+    tg_id_clean = str(tg_id)
+
+    # --- Pass 1: numeric ID match (the canonical case) ---
     for u in data.get("users", []):
         stored = str(u.get("telegramId", "") or "").lstrip("@")
         if stored and stored == tg_id_clean:
             return u
+
+    # --- Pass 2: username match + auto-resolve ---
+    if tg_username:
+        username_clean = str(tg_username).lstrip("@").lower()
+        for u in data.get("users", []):
+            stored = str(u.get("telegramId", "") or "").lstrip("@")
+            # Skip empty and numeric values (numeric was handled in pass 1).
+            if not stored or stored.isdigit():
+                continue
+            if stored.lower() == username_clean:
+                # Replace the username placeholder with the actual numeric ID
+                # and persist, so the link is permanent and rename-proof.
+                u['telegramId'] = tg_id_clean
+                if _save_data_fn is not None:
+                    try:
+                        _save_data_fn(data)
+                        logger.info(
+                            f"Telegram link auto-resolved: @{username_clean} -> {tg_id_clean} "
+                            f"(panel user '{u.get('username')}')"
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist Telegram auto-link")
+                return u
     return None
 
 
@@ -127,9 +166,10 @@ def _build_connections_keyboard(conns: list, data: dict) -> dict:
 async def _handle_start(api: TelegramAPI, msg: dict, load_data_fn: Callable):
     chat_id = msg["chat"]["id"]
     tg_id = str(msg["from"]["id"])
+    tg_username = msg["from"].get("username")
     first_name = msg["from"].get("first_name", "")
 
-    panel_user = _find_user(load_data_fn, tg_id)
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
 
     if not panel_user:
         await api.send_message(
@@ -167,10 +207,11 @@ async def _handle_start(api: TelegramAPI, msg: dict, load_data_fn: Callable):
 #  Refresh — edit existing message with updated list
 # ----------------------------------------------------------------------- #
 async def _handle_refresh(
-    api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, load_data_fn: Callable
+    api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, load_data_fn: Callable,
+    tg_username: Optional[str] = None,
 ):
     await api.answer_callback(callback_id, "Updated!")
-    panel_user = _find_user(load_data_fn, tg_id)
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.edit_message(chat_id, message_id, "❌ Access denied.")
         return
@@ -199,10 +240,11 @@ async def _handle_get_config(
     tg_id: str,
     load_data_fn: Callable,
     generate_vpn_link_fn: Callable,
+    tg_username: Optional[str] = None,
 ):
     await api.answer_callback(callback_id, "Fetching config...")
 
-    panel_user = _find_user(load_data_fn, tg_id)
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.send_message(chat_id, "❌ Access denied.")
         return
@@ -263,6 +305,12 @@ async def _handle_get_config(
             elif proto == "telemt":
                 mgr = TelemtManager(ssh)
                 cfg = mgr.get_client_config(proto, conn["client_id"], server["host"], port)
+            elif proto == "webproxy":
+                from managers.webproxy_manager import WebProxyManager
+                mgr = WebProxyManager(ssh)
+                # host/port are ignored there: the link carries the relay's own
+                # public hostname and always port 443.
+                cfg = mgr.get_client_config(proto, conn["client_id"], server["host"], port)
             else:
                 # awg, awg2, awg_legacy
                 mgr = AWGManager(ssh)
@@ -277,7 +325,7 @@ async def _handle_get_config(
                 await api.edit_message(chat_id, loading_msg_id, "❌ Failed to retrieve configuration.")
             return
 
-        vpn_link = generate_vpn_link_fn(config) if config else ""
+        vpn_link = generate_vpn_link_fn(config, proto) if config else ""
 
         # Delete loading message
         if loading_msg_id:
@@ -294,7 +342,7 @@ async def _handle_get_config(
 
         # ------- 2. Send config (format depends on protocol) -------
         # Protocols that return a link/URI rather than an INI-style config file
-        is_link_proto = proto in ("xray", "telemt")
+        is_link_proto = proto in ("xray", "telemt", "webproxy")
 
         if is_link_proto:
             # Show as a tappable link — no .conf file needed
@@ -313,7 +361,7 @@ async def _handle_get_config(
                     await api.send_message(chat_id, f"<b>📄 Configuration (part {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>")
 
             # VPN deep-link (vpn:// base64 URI for the Amnezia app)
-            vpn_link = generate_vpn_link_fn(config)
+            vpn_link = generate_vpn_link_fn(config, proto)
             if vpn_link:
                 await api.send_message(
                     chat_id,
@@ -393,12 +441,13 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         chat_id = cq["message"]["chat"]["id"]
         message_id = cq["message"]["message_id"]
         tg_id = str(cq["from"]["id"])
+        tg_username = cq["from"].get("username")
 
         if data_str == "refresh":
-            await _handle_refresh(api, chat_id, message_id, callback_id, tg_id, load_data_fn)
+            await _handle_refresh(api, chat_id, message_id, callback_id, tg_id, load_data_fn, tg_username)
         elif data_str.startswith("cfg:"):
             conn_id = data_str[4:]
             await _handle_get_config(
                 api, chat_id, message_id, callback_id,
-                conn_id, tg_id, load_data_fn, generate_vpn_link_fn
+                conn_id, tg_id, load_data_fn, generate_vpn_link_fn, tg_username
             )

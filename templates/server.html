@@ -72,7 +72,7 @@
                 style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
         </div>
         <div class="protocol-desc">
-            {{ _('awg_desc') }}
+            {{ _('awg2_desc') }}
         </div>
         <div class="protocol-status" id="awg2-status">
             <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
@@ -88,7 +88,10 @@
         </div>
     </div>
 
-    <!-- AWG Card -->
+    <!-- AWG Card — hidden in fork: functionally identical to AmneziaWG 2.0,
+         only differs by container name and a `protocol_version: 2` flag in
+         the client JSON. Kept as an HTML comment so we don't drift far from
+         upstream when pulling updates.
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
             <div class="protocol-icon">🔮</div>
@@ -111,6 +114,8 @@
             </button>
         </div>
     </div>
+    -->
+    <div id="proto-awg" style="display:none"></div>
 
     <!-- AWG Legacy Card -->
     <div class="card card-hover protocol-card protocol-legacy" id="proto-awg-legacy">
@@ -178,6 +183,30 @@
         </div>
         <div class="flex gap-sm" id="telemt-actions">
             <button class="btn btn-primary btn-sm" onclick="openInstallModal('telemt')" id="telemt-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+    </div>
+
+    <!-- Telegram WEB Proxy Card -->
+    <div class="card card-hover protocol-card protocol-webproxy" id="proto-webproxy">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon">🌐</div>
+            <div class="flex gap-sm" id="webproxy-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">Telegram WEB Proxy</div>
+        <div class="protocol-desc">
+            {{ _('webproxy_desc') }}
+        </div>
+        <div class="protocol-status" id="webproxy-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="webproxy-info" class="hidden">
+            <div class="protocol-info" id="webproxy-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="webproxy-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('webproxy')" id="webproxy-install-btn"
                 style="flex:1">
                 {{ _('install') }}
             </button>
@@ -357,11 +386,11 @@
         <div class="flex gap-sm items-center">
             <select class="form-select" id="connProtoSelect" onchange="loadConnections()"
                 style="width:auto; min-width:160px;">
-                <option value="awg">AmneziaWG</option>
                 <option value="awg2">AmneziaWG 2.0</option>
                 <option value="awg_legacy">AWG Legacy</option>
                 <option value="xray">Xray</option>
                 <option value="telemt">Telemt</option>
+                <option value="webproxy">Telegram WEB Proxy</option>
                 <option value="wireguard">WireGuard</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="openAddConnectionModal()">
@@ -419,6 +448,58 @@
                     <label class="form-label">{{ _('max_connections_limit') }}</label>
                     <input class="form-input" type="number" id="installTelemtMaxConns" value="0" min="0">
                     <div class="form-hint">{{ _('max_connections_hint') }}</div>
+                </div>
+            </div>
+
+            <div id="webproxyOptions"
+                style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_hostname') }}</label>
+                    <input class="form-input" type="text" id="installWebproxyHost" placeholder="tp.example.com">
+                    <div class="form-hint">{{ _('webproxy_hostname_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_acme_email') }}</label>
+                    <input class="form-input" type="email" id="installWebproxyEmail" placeholder="admin@example.com">
+                    <div class="form-hint">{{ _('webproxy_acme_email_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_carrier_mode') }}</label>
+                    <select class="form-input" id="installWebproxyCarrier">
+                        <option value="https">https</option>
+                        <option value="https-lanes">https-lanes</option>
+                        <option value="websocket">websocket</option>
+                        <option value="websocket-lanes">websocket-lanes</option>
+                    </select>
+                    <div class="form-hint">{{ _('webproxy_carrier_mode_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('webproxy_site_mode') }}</label>
+                    <select class="form-input" id="installWebproxySiteMode"
+                        onchange="toggleWebproxySiteFields()">
+                        <option value="generated">{{ _('webproxy_site_generated') }}</option>
+                        <option value="upstream">{{ _('webproxy_site_upstream') }}</option>
+                    </select>
+                    <div class="form-hint">{{ _('webproxy_site_mode_hint') }}</div>
+                </div>
+                <div id="webproxySiteGeneratedFields">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_name') }}</label>
+                        <input class="form-input" type="text" id="installWebproxySiteName" placeholder="Vasnetsov Joinery">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_tagline') }}</label>
+                        <input class="form-input" type="text" id="installWebproxySiteTagline" placeholder="Small workshop">
+                    </div>
+                </div>
+                <div id="webproxySiteUpstreamFields" style="display:none;">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('webproxy_site_upstream_url') }}</label>
+                        <input class="form-input" type="text" id="installWebproxyUpstream" placeholder="http://127.0.0.1:3000">
+                    </div>
+                </div>
+                <div class="form-hint" style="color:var(--warn, #b8860b); margin-top:var(--space-sm);">
+                    {{ _('webproxy_site_warning') }}
                 </div>
             </div>
 
@@ -561,6 +642,27 @@
             </select>
         </div>
 
+        <div id="webproxyConnOptions"
+            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+            <div class="form-group">
+                <label class="form-label">{{ _('webproxy_secret') }}</label>
+                <input class="form-input" type="text" id="webproxySecret" placeholder="Optional (auto-generated if empty)">
+                <div class="form-hint">{{ _('webproxy_secret_hint') }}</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('webproxy_carrier_mode') }}</label>
+                <select class="form-input" id="webproxyCarrier">
+                    <option value="https">https</option>
+                    <option value="https-lanes">https-lanes</option>
+                    <option value="websocket">websocket</option>
+                    <option value="websocket-lanes">websocket-lanes</option>
+                </select>
+            </div>
+            <div class="form-hint" style="color:var(--warn, #b8860b);">
+                {{ _('webproxy_restart_warning') }}
+            </div>
+        </div>
+
         <div id="telemtConnOptions"
             style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
             <div class="form-group">
@@ -683,6 +785,30 @@
         </div>
     </div>
 </div>
+
+<!-- ===== Protocol Backup Modal ===== -->
+<div class="modal-backdrop" id="backupModal">
+    <div class="modal" style="max-width:560px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="backupModalTitle">{{ _('backups') }}</h2>
+            <button class="modal-close" onclick="closeModal('backupModal')">×</button>
+        </div>
+        <input type="hidden" id="backupProto" value="" />
+        <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('backup_desc') }}</div>
+        <div style="display:flex; gap:var(--space-sm); margin-bottom:var(--space-md);">
+            <button class="btn btn-primary btn-sm" onclick="createProtocolBackup()" id="createBackupBtn" style="flex:1">
+                {{ _('create_backup') }}
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="loadProtocolBackups()">{{ _('refresh') }}</button>
+        </div>
+        <div id="backupLoading" class="form-hint hidden">{{ _('loading') }}</div>
+        <div id="backupEmpty" class="empty-state hidden" style="padding:var(--space-xl);">
+            <div class="empty-title">{{ _('no_backups') }}</div>
+            <div class="empty-desc">{{ _('no_backups_desc') }}</div>
+        </div>
+        <div id="backupList" style="display:flex; flex-direction:column; gap:var(--space-sm);"></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -731,6 +857,7 @@
             case 'awg_legacy': return 'AWG Legacy';
             case 'xray': return 'Xray';
             case 'telemt': return 'Telemt';
+            case 'webproxy': return 'Telegram WEB Proxy';
             case 'wireguard': return 'WireGuard';
             case 'dns': return 'AmneziaDNS';
             case 'socks5': return 'SOCKS5 Proxy';
@@ -787,7 +914,7 @@
 
                 for (const [proto, info] of Object.entries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
+                    const isVPN = ['awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'wireguard'].includes(proto);
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -828,7 +955,7 @@
     }
 
     function updateStatusCounts(protocols) {
-        const protos = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
+        const protos = ['awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'wireguard'];
         const servs = ['dns', 'adguard', 'socks5'];
 
         let pRunning = 0, pTotal = protos.length;
@@ -902,7 +1029,10 @@
                 if (isService) {
                     grid = buildServiceInfoGrid(proto, info);
                 } else if (info.port) {
-                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${(proto === 'xray' || proto === 'telemt') ? 'TCP' : 'UDP'}</span></div>`;
+                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}/${(proto === 'xray' || proto === 'telemt' || proto === 'webproxy') ? 'TCP' : 'UDP'}</span></div>`;
+                    if (proto === 'webproxy' && info.hostname) {
+                        grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('webproxy_hostname')}</span><span class="protocol-info-value">${info.hostname}</span></div>`;
+                    }
                 }
                 if (!isService && info.clients_count !== undefined) {
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
@@ -940,13 +1070,19 @@
             // unbound's static config), so we don't expose a raw editor for them.
             if (ctrlEl) {
                 ctrlEl.style.cssText = '';
+                // Backup sits on the control row for every protocol (services
+                // included — their configs are worth archiving too), so we add
+                // it once here instead of per-protocol like upstream does.
+                const backupBtn = `<button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')" title="${_('backup_desc')}">${_('backup')}</button>`;
                 if (isService) {
                     ctrlEl.innerHTML = `
+                        ${backupBtn}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
                     ctrlEl.innerHTML = `
                         <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
+                        ${backupBtn}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 }
@@ -1066,6 +1202,12 @@
         }
     }
 
+    function toggleWebproxySiteFields() {
+        const mode = document.getElementById('installWebproxySiteMode').value;
+        document.getElementById('webproxySiteGeneratedFields').style.display = mode === 'generated' ? '' : 'none';
+        document.getElementById('webproxySiteUpstreamFields').style.display = mode === 'upstream' ? '' : 'none';
+    }
+
     // ========== Protocol Installation ==========
     function openInstallModal(proto) {
         currentInstallProto = proto;
@@ -1076,10 +1218,12 @@
         const portLabel = document.getElementById('installPortLabel');
         const portHint = document.getElementById('installPortHint');
         const telemtOpts = document.getElementById('telemtOptions');
+        const webproxyOpts = document.getElementById('webproxyOptions');
         const socks5Opts = document.getElementById('socks5Options');
         const adguardOpts = document.getElementById('adguardOptions');
 
         telemtOpts.style.display = 'none';
+        webproxyOpts.style.display = 'none';
         socks5Opts.style.display = 'none';
         adguardOpts.style.display = 'none';
 
@@ -1099,6 +1243,15 @@
             portInput.disabled = false;
             portHint.textContent = _('telemt_port_hint');
             telemtOpts.style.display = 'block';
+        } else if (proto === 'webproxy') {
+            // 443 is fixed by the WEB proxy type: the client accepts a hostname
+            // and a secret, and no port at all.
+            portLabel.textContent = _('port') + ' (TCP)';
+            portInput.value = '443';
+            portInput.disabled = true;
+            portHint.textContent = _('webproxy_port_hint');
+            webproxyOpts.style.display = 'block';
+            toggleWebproxySiteFields();
         } else if (proto === 'socks5') {
             portLabel.textContent = _('port') + ' (TCP)';
             portInput.value = '38080';
@@ -1162,6 +1315,14 @@
                 params.tls_emulation = document.getElementById('installTelemtTls').checked;
                 params.tls_domain = document.getElementById('installTelemtDomain').value;
                 params.max_connections = parseInt(document.getElementById('installTelemtMaxConns').value) || 0;
+            } else if (currentInstallProto === 'webproxy') {
+                params.webproxy_hostname = document.getElementById('installWebproxyHost').value.trim();
+                params.webproxy_acme_email = document.getElementById('installWebproxyEmail').value.trim();
+                params.webproxy_carrier_mode = document.getElementById('installWebproxyCarrier').value;
+                params.webproxy_site_mode = document.getElementById('installWebproxySiteMode').value;
+                params.webproxy_site_name = document.getElementById('installWebproxySiteName').value.trim();
+                params.webproxy_site_tagline = document.getElementById('installWebproxySiteTagline').value.trim();
+                params.webproxy_site_upstream = document.getElementById('installWebproxyUpstream').value.trim();
             } else if (currentInstallProto === 'socks5') {
                 params.socks5_username = document.getElementById('installSocks5User').value || 'proxy_user';
                 params.socks5_password = document.getElementById('installSocks5Pass').value || '';
@@ -1193,6 +1354,98 @@
             logEl.scrollTop = logEl.scrollHeight;
             showToast(_('install_error') + err.message, 'error');
             document.getElementById('installDone').style.display = '';
+        }
+    }
+
+    // ===== Protocol backups =====
+    function formatBackupTime(mtime) {
+        if (!mtime) return '—';
+        try { return new Date(mtime * 1000).toLocaleString(); } catch (_) { return '—'; }
+    }
+
+    async function showProtocolBackups(proto) {
+        document.getElementById('backupProto').value = proto;
+        document.getElementById('backupModalTitle').textContent = `${_('backups')} — ${getProtoTitle(proto)}`;
+        openModal('backupModal');
+        await loadProtocolBackups();
+    }
+
+    async function loadProtocolBackups() {
+        const proto = document.getElementById('backupProto').value;
+        const list = document.getElementById('backupList');
+        const empty = document.getElementById('backupEmpty');
+        const loading = document.getElementById('backupLoading');
+        list.innerHTML = '';
+        empty.classList.add('hidden');
+        loading.classList.remove('hidden');
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/backups`, 'POST', { protocol: proto });
+            const backups = res.backups || [];
+            if (!backups.length) {
+                empty.classList.remove('hidden');
+                return;
+            }
+            list.innerHTML = backups.map(b => `
+                <div class="protocol-info-item" style="flex-direction:row; align-items:center; gap:var(--space-sm);">
+                    <div style="min-width:0; flex:1;">
+                        <div class="protocol-info-value" style="word-break:break-all;">${b.name}</div>
+                        <div class="protocol-info-label">${formatBytes(b.size)} • ${formatBackupTime(b.mtime)}</div>
+                    </div>
+                    <button class="btn btn-secondary btn-sm" onclick="downloadProtocolBackup('${proto}', '${b.name}')">${_('download')}</button>
+                </div>
+            `).join('');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            loading.classList.add('hidden');
+        }
+    }
+
+    async function createProtocolBackup() {
+        const proto = document.getElementById('backupProto').value;
+        const btn = document.getElementById('createBackupBtn');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = _('creating_backup');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/backups/create`, 'POST', { protocol: proto });
+            showToast(_('backup_created'), 'success');
+            await loadProtocolBackups();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+        }
+    }
+
+    async function downloadProtocolBackup(proto, filename) {
+        try {
+            // Not apiCall(): the response is a binary archive, not JSON.
+            const res = await fetch(`/api/servers/${SERVER_ID}/backups/download`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ protocol: proto, filename })
+            });
+            if (!res.ok) {
+                let message = 'Download failed';
+                try {
+                    const data = await res.json();
+                    message = data.error || message;
+                } catch (_) {}
+                throw new Error(message);
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
         }
     }
 
@@ -1291,7 +1544,7 @@
                 const sent = userData.dataSent || '';
                 const initial = name.charAt(0).toUpperCase();
                 const enabled = (client.enabled !== undefined) ? client.enabled : (userData.enabled !== false);
-                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt';
+                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || proto === 'webproxy';
                 const assignedUser = client.assigned_user || '';
 
                 let metaHtml = '';
@@ -1329,8 +1582,8 @@
                             </div>
                         </div>
                         <div class="client-actions">
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt'})" title="${_('config')}">📄</button>
-                            ${proto === 'telemt' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || proto === 'webproxy'})" title="${_('config')}">📄</button>
+                            ${(proto === 'telemt' || proto === 'webproxy') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled})" title="${toggleTitle}">${toggleIcon}</button>
                             <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">🗑</button>
                         </div>
@@ -1357,6 +1610,10 @@
             const params = {
                 protocol: proto, name: connName, user_id: userId,
             };
+            if (proto === 'webproxy') {
+                params.webproxy_secret = document.getElementById('webproxySecret').value || null;
+                params.webproxy_carrier_mode = document.getElementById('webproxyCarrier').value || null;
+            }
             if (proto === 'telemt') {
                 params.telemt_quota = document.getElementById('telemtQuota').value || null;
                 params.telemt_max_ips = parseInt(document.getElementById('telemtMaxIps').value) || null;
@@ -1364,8 +1621,9 @@
                 params.telemt_secret = document.getElementById('telemtSecret').value || null;
                 params.telemt_ad_tag = document.getElementById('telemtAdTag').value || null;
                 params.telemt_max_conns = parseInt(document.getElementById('telemtMaxConns').value) || null;
-                if (isEditingConn) params.client_id = editingClientId;
             }
+            // Applies to every editable protocol, not just telemt.
+            if (isEditingConn) params.client_id = editingClientId;
             const result = await apiCall(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, 'POST', params);
             if (isEditingConn) {
                 showToast('Подключение обновлено', 'success');
@@ -1381,11 +1639,11 @@
                     document.getElementById('configModalTitle').textContent = `Конфигурация — ${connName}`;
                     document.getElementById('configText').textContent = result.config;
                     document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                    document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-                    document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+                    document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
+                    document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
                     switchConfigTab('conf');
                     openModal('configModal');
-                    generateQR(result.config);
+                    generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
                 }
             }
             loadConnections();
@@ -1404,11 +1662,24 @@
     function openAddConnectionModal(isEdit = false, clientData = null) {
         isEditingConn = isEdit;
         const proto = document.getElementById('connProtoSelect').value;
+        const webproxyOpts = document.getElementById('webproxyConnOptions');
+        if (webproxyOpts) webproxyOpts.style.display = (proto === 'webproxy') ? 'block' : 'none';
         const telemtOpts = document.getElementById('telemtConnOptions');
 
         document.getElementById('addConnectionModalTitle').textContent = isEdit ? 'Редактировать подключение' : 'Добавить подключение';
         document.getElementById('addConnBtnText').textContent = isEdit ? 'Сохранить' : 'Создать';
         document.getElementById('connectionNameGroup').style.display = isEdit ? 'none' : 'block';
+
+        if (proto === 'webproxy') {
+            if (isEdit && clientData) {
+                editingClientId = clientData.clientName;
+                document.getElementById('webproxySecret').value = clientData.token || '';
+                document.getElementById('webproxyCarrier').value = clientData.carrier_mode || 'https';
+            } else {
+                document.getElementById('webproxySecret').value = '';
+                document.getElementById('webproxyCarrier').value = 'https';
+            }
+        }
 
         if (proto === 'telemt') {
             telemtOpts.style.display = 'block';
@@ -1460,9 +1731,9 @@
         const proto = document.getElementById('connProtoSelect').value;
 
         // Restore tabs visibility first
-        document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
+        document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
         document.getElementById('panel-qr').style.display = '';
-        document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+        document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || proto === 'webproxy') ? 'none' : '');
         document.querySelectorAll('.config-tab')[2].style.display = '';
 
         // Client was created via native Amnezia app — private key is not stored server-side
@@ -1496,7 +1767,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             }
         } catch (err) {
             showToast('Ошибка: ' + err.message, 'error');
@@ -1529,18 +1800,43 @@
         document.getElementById(panels[tab]).classList.add('active');
     }
 
-    function generateQR(text) {
+    let _qrRotateTimer = null;
+
+    function generateQR(payload) {
         const container = document.getElementById('qrCode');
         container.innerHTML = '';
-        try {
-            new QRCode(container, {
-                text: text, width: 280, height: 280,
-                colorDark: '#000000', colorLight: '#ffffff',
-                correctLevel: QRCode.CorrectLevel.L
-            });
-        } catch (e) {
-            console.error('QR lib error:', e);
-            container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        if (_qrRotateTimer) { clearInterval(_qrRotateTimer); _qrRotateTimer = null; }
+
+        const chunks = Array.isArray(payload) ? payload : [payload];
+        let idx = 0;
+
+        // Counter shown under the QR when there are multiple chunks — the
+        // Amnezia mobile scanner expects sequential frames and tracks progress.
+        let counterEl = null;
+        if (chunks.length > 1) {
+            counterEl = document.createElement('div');
+            counterEl.style.cssText = 'text-align:center;margin-top:0.5rem;color:var(--text-muted);font-size:0.85rem;';
+            container.insertAdjacentElement('afterend', counterEl);
+        }
+
+        const render = () => {
+            container.innerHTML = '';
+            try {
+                new QRCode(container, {
+                    text: chunks[idx], width: 280, height: 280,
+                    colorDark: '#000000', colorLight: '#ffffff',
+                    correctLevel: QRCode.CorrectLevel.L
+                });
+                if (counterEl) counterEl.textContent = `${idx + 1} / ${chunks.length}`;
+            } catch (e) {
+                console.error('QR lib error:', e);
+                container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+            }
+        };
+
+        render();
+        if (chunks.length > 1) {
+            _qrRotateTimer = setInterval(() => { idx = (idx + 1) % chunks.length; render(); }, 750);
         }
     }
 

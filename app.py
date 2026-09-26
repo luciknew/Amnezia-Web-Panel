@@ -1,15 +1,21 @@
 import os
+import re
 import sys
 import json
 import logging
 import base64
 import hashlib
+import struct
+import zlib
 import secrets
+import shlex
+import tempfile
 import uuid
 import asyncio
 from datetime import datetime
 import io
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File
@@ -28,6 +34,10 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.backup_manager import BackupManager
+from managers.email_manager import (
+    SMTPSettings, EmailAttachment, send_email as smtp_send_email, render_qr_png,
+)
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -46,6 +56,7 @@ OPENAPI_TAGS = [
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
+    {"name": "External", "description": "Endpoints for external bots / scripts. Same Bearer-token auth as the rest of the API, but the output is filtered to whatever the admin has explicitly flagged as allowed for external access (per-server `allow_vovka`)."},
 ]
 
 app = FastAPI(
@@ -77,12 +88,44 @@ app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', se
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
+
+def _country_flag(code: str) -> str:
+    """ISO 3166-1 alpha-2 country code → flag emoji (e.g. 'DE' → '🇩🇪').
+    Returns '' for anything that doesn't look like a 2-letter code, so the
+    template can safely render `{{ country_code | country_flag }}` even on
+    servers where geo-lookup failed."""
+    if not code or len(code) != 2:
+        return ''
+    code = code.upper()
+    if not (code[0].isalpha() and code[1].isalpha()):
+        return ''
+    # Regional Indicator Symbol Letters live at U+1F1E6 ('A') onwards.
+    return chr(0x1F1E6 + ord(code[0]) - ord('A')) + \
+           chr(0x1F1E6 + ord(code[1]) - ord('A'))
+
+
+templates.env.filters['country_flag'] = _country_flag
+
 if getattr(sys, 'frozen', False):
     application_path = os.path.dirname(sys.executable)
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+# Persist storage in a dedicated subdirectory so a single bind-mount/volume
+# (./data:/app/data) survives container rebuilds without overlaying source code.
+DATA_DIR = os.environ.get('DATA_DIR') or os.path.join(application_path, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, 'data.json')
+
+# One-shot migration: if a legacy data.json sits next to app.py (pre-mount
+# layout), move it into DATA_DIR so existing installs don't lose anything.
+_legacy_data = os.path.join(application_path, 'data.json')
+if os.path.exists(_legacy_data) and not os.path.exists(DATA_FILE):
+    try:
+        os.replace(_legacy_data, DATA_FILE)
+    except OSError:
+        pass
+
 CURRENT_VERSION = "v1.4.3"
 
 
@@ -142,7 +185,26 @@ def load_data():
             'remnawave_protocol': 'awg'
         }
     })
+    # Ensure the email settings block exists even on installations that pre-date
+    # the EMAIL feature, so settings.html template lookups don't crash.
+    data['settings'].setdefault('email', {
+        'host': '', 'port': 587, 'username': '', 'password': '',
+        'from_email': '', 'from_name': '', 'encryption': 'starttls',
+    })
+    # Stable server uid: `server_id` is just the list index and shifts on
+    # reorder/delete, so external systems (Vovka) keep the uid instead.
+    # Servers without one get a value derived from their SSH endpoint — the
+    # same on every load, no write here (concurrent loads can't disagree);
+    # the startup migration persists it.
+    for srv in data['servers']:
+        if not srv.get('uid'):
+            srv['uid'] = _derived_server_uid(srv)
     return data
+
+
+def _derived_server_uid(srv: dict) -> str:
+    key = f"{srv.get('host', '')}:{srv.get('ssh_port', 22)}:{srv.get('username', '')}"
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]
 
 
 def save_data(data):
@@ -166,6 +228,13 @@ def get_ssh(server):
     )
 
 
+def get_client_host(server):
+    # Address embedded into client VPN configs. May differ from SSH host
+    # when the server is behind NAT and reachable via different addresses
+    # for admin (SSH) and for end-user VPN traffic.
+    return (server.get('client_host') or '').strip() or server['host']
+
+
 def get_protocol_manager(ssh, protocol: str):
     if protocol == 'xray':
         from managers.xray_manager import XrayManager
@@ -173,6 +242,9 @@ def get_protocol_manager(ssh, protocol: str):
     elif protocol == 'telemt':
         from managers.telemt_manager import TelemtManager
         return TelemtManager(ssh)
+    elif protocol == 'webproxy':
+        from managers.webproxy_manager import WebProxyManager
+        return WebProxyManager(ssh)
     elif protocol == 'dns':
         from managers.dns_manager import DNSManager
         return DNSManager(ssh)
@@ -197,7 +269,192 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
-def generate_vpn_link(config_text):
+_AWG_OBFUSCATION_KEYS = (
+    'H1', 'H2', 'H3', 'H4',
+    'S1', 'S2', 'S3', 'S4',
+    'Jc', 'Jmin', 'Jmax',
+    'I1', 'I2', 'I3', 'I4', 'I5',
+)
+
+
+def _parse_wg_conf(text: str) -> dict:
+    """Parse a WireGuard/AmneziaWG .conf into {'interface': {...}, 'peer': {...}}."""
+    sections: dict = {}
+    cur = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            cur = line[1:-1].strip().lower()
+            sections.setdefault(cur, {})
+            continue
+        if '=' not in line or cur is None:
+            continue
+        key, _, val = line.partition('=')
+        sections[cur][key.strip()] = val.strip()
+    return sections
+
+
+def _build_amnezia_awg_link(config_text: str, container: str) -> str:
+    """Build a native Amnezia `vpn://` link for AmneziaWG / AmneziaWG 2.0,
+    matching the format the official Amnezia client accepts as pasted text.
+    Reference: https://github.com/auswuchs/awg-converter (MIT)."""
+    blob = _amnezia_compressed_blob(config_text, container)
+    b64 = base64.urlsafe_b64encode(blob).rstrip(b'=').decode('ascii')
+    return f"vpn://{b64}"
+
+
+def _amnezia_compressed_blob(config_text: str, container: str) -> bytes:
+    """Build the qCompress'd JSON blob that Amnezia's vpn:// wraps in base64.
+    Returned bytes are exactly what gets split into QR chunks (see below)."""
+    conf = _parse_wg_conf(config_text)
+    iface = conf.get('interface', {})
+    peer = conf.get('peer', {})
+
+    priv_key = iface.get('PrivateKey', '')
+    addr = iface.get('Address', '10.8.0.2/32')
+    dns = iface.get('DNS', '1.1.1.1, 1.0.0.1')
+    mtu = iface.get('MTU', '1280')
+
+    pub_key = peer.get('PublicKey', '')
+    psk = peer.get('PresharedKey', '')
+    allowed = peer.get('AllowedIPs', '0.0.0.0/0, ::/0')
+    endpoint = peer.get('Endpoint', '')
+    keepalive = peer.get('PersistentKeepalive', '25')
+
+    last_colon = endpoint.rfind(':')
+    if last_colon >= 0:
+        host, port_str = endpoint[:last_colon], endpoint[last_colon + 1:]
+    else:
+        host, port_str = endpoint, '51820'
+    try:
+        port_int = int(port_str)
+    except ValueError:
+        port_int = 51820
+
+    dns_parts = [d.strip() for d in dns.split(',')]
+    dns1 = dns_parts[0] if dns_parts else '1.1.1.1'
+    dns2 = dns_parts[1] if len(dns_parts) > 1 else '1.0.0.1'
+
+    client_ip = addr.split('/')[0]
+    subnet = '.'.join(client_ip.split('.')[:3]) + '.0'
+
+    awg_params = {k: iface[k] for k in _AWG_OBFUSCATION_KEYS if k in iface}
+    allowed_arr = [s.strip() for s in allowed.split(',') if s.strip()]
+
+    last_config = {
+        **awg_params,
+        'allowed_ips': allowed_arr,
+        'clientId': '',
+        'client_ip': client_ip,
+        'client_priv_key': priv_key,
+        'client_pub_key': '',
+        'config': config_text.strip(),
+        'hostName': host,
+        'mtu': mtu,
+        'persistent_keep_alive': str(keepalive),
+        'port': port_int,
+        'psk_key': psk,
+        'server_pub_key': pub_key,
+    }
+    awg_obj = {
+        **awg_params,
+        'last_config': json.dumps(last_config, separators=(',', ':')),
+        'port': port_str,
+        'subnet_address': subnet,
+        'transport_proto': 'udp',
+    }
+    if container == 'amnezia-awg2':
+        awg_obj['protocol_version'] = '2'
+    payload = {
+        'containers': [{'awg': awg_obj, 'container': container}],
+        'defaultContainer': container,
+        'description': f'AWG {host}',
+        'dns1': dns1,
+        'dns2': dns2,
+        'hostName': host,
+    }
+    raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    # Qt qCompress: 4-byte big-endian uncompressed size + standard zlib stream
+    return struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+
+
+# Amnezia mobile QR scanner expects multi-chunk frames with this magic prefix.
+# Source: amnezia-client/client/core/utils/qrCodeUtils.{h,cpp}.
+_AMNEZIA_QR_MAGIC = 1984  # 0x07C0, qint16 big-endian
+_AMNEZIA_QR_CHUNK_SIZE = 850  # bytes of raw blob per chunk (matches client)
+
+
+def _amnezia_qr_chunks_from_blob(blob: bytes) -> list:
+    """Split the qCompress'd Amnezia blob into base64url QR chunks.
+
+    Each chunk is the QDataStream serialization (default Qt 5/6 version,
+    big-endian) of: qint16 magic, quint8 chunksCount, quint8 chunkIndex,
+    QByteArray data. QDataStream prefixes every QByteArray with its length
+    as a quint32 (or 0xFFFFFFFF for a null array), so the on-wire layout is:
+
+        qint16 BE  magic = 1984
+        quint8     total_chunks
+        quint8     chunk_index (0-based)
+        quint32 BE data_length
+        bytes      up to 850 bytes of the blob
+
+    Result is base64url-encoded without padding (matches Qt
+    Base64UrlEncoding | OmitTrailingEquals)."""
+    total = max(1, (len(blob) + _AMNEZIA_QR_CHUNK_SIZE - 1) // _AMNEZIA_QR_CHUNK_SIZE)
+    if total > 255:
+        # quint8 ceiling — should never happen for realistic VPN configs.
+        raise ValueError(f"Config too large to chunk: {len(blob)} bytes")
+    chunks = []
+    for i in range(total):
+        slice_ = blob[i * _AMNEZIA_QR_CHUNK_SIZE:(i + 1) * _AMNEZIA_QR_CHUNK_SIZE]
+        frame = struct.pack('>hBBI', _AMNEZIA_QR_MAGIC, total, i, len(slice_)) + slice_
+        chunks.append(base64.urlsafe_b64encode(frame).rstrip(b'=').decode('ascii'))
+    return chunks
+
+
+def generate_vpn_qr_chunks(config_text: str, protocol: str = '') -> list:
+    """For AWG/AWG2 return the list of base64url QR-chunk strings expected by
+    the official Amnezia mobile scanner. For other protocols return [] —
+    callers fall back to a single QR built from `config` or `vpn_link`."""
+    if not config_text:
+        return []
+    container = {'awg': 'amnezia-awg', 'awg2': 'amnezia-awg2'}.get(protocol)
+    if not container:
+        return []
+    try:
+        return _amnezia_qr_chunks_from_blob(_amnezia_compressed_blob(config_text, container))
+    except Exception:
+        logger.exception("Failed to build Amnezia QR chunks for %s", protocol)
+        return []
+
+
+def generate_vpn_link(config_text, protocol: str = ''):
+    """Build the QR-importable link for a generated client config.
+
+    For AmneziaWG / AmneziaWG 2.0 we emit the native Amnezia `vpn://` format
+    (zlib-compressed JSON) so the official Amnezia mobile/desktop client picks
+    it up via QR scan. For every other protocol — including AWG Legacy, plain
+    WireGuard, Xray, Telemt — we keep the original `vpn://base64(raw_conf)`
+    wrapper for backward compatibility.
+    """
+    if not config_text:
+        return ''
+    if protocol == 'webproxy':
+        # Already a tg://webproxy?... deep link the client resolves itself —
+        # wrapping it in vpn://base64 would only hide it from every scanner.
+        return config_text.strip()
+    if protocol == 'awg':
+        try:
+            return _build_amnezia_awg_link(config_text, 'amnezia-awg')
+        except Exception:
+            logger.exception("Failed to build native Amnezia vpn:// for awg, falling back")
+    elif protocol == 'awg2':
+        try:
+            return _build_amnezia_awg_link(config_text, 'amnezia-awg2')
+        except Exception:
+            logger.exception("Failed to build native Amnezia vpn:// for awg2, falling back")
     b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64}"
 
@@ -393,9 +650,9 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
                 manager = get_protocol_manager(ssh, c_req['protocol'])
                 
                 if c_req['protocol'] == 'wireguard':
-                    res = await asyncio.to_thread(manager.add_client, c_req['name'], srv['host'])
+                    res = await asyncio.to_thread(manager.add_client, c_req['name'], get_client_host(srv))
                 else:
-                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], srv['host'], port)
+                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], get_client_host(srv), port)
                 
                 if res.get('client_id'):
                     new_conn = {
@@ -586,6 +843,7 @@ def tpl(request, template, **kwargs):
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
         'telegram_settings': data.get('settings', {}).get('telegram', {}),
+        'email_settings': data.get('settings', {}).get('email', {}),
         'bot_running': tg_bot.is_running(),
         'lang': lang,
         '_': lambda text_id: _t(text_id, lang),
@@ -606,16 +864,23 @@ class LoginRequest(BaseModel):
 
 class AddServerRequest(BaseModel):
     host: str = ''
+    client_host: str = ''
     ssh_port: int = 22
     username: str = ''
     password: str = ''
     private_key: str = ''
     name: str = ''
+    description: str = ''
+    # External-bot gate: when True, the server shows up in /api/external/servers
+    # for any caller authenticated with a Bearer token.
+    allow_vovka: bool = False
 
 
 class EditServerRequest(BaseModel):
     name: str = ''
     host: str = ''
+    # None = keep current, '' = clear (falls back to SSH host), value = set.
+    client_host: Optional[str] = None
     ssh_port: int = 22
     username: str = ''
     # Optional[str] = None lets the client distinguish "leave field as is"
@@ -623,6 +888,10 @@ class EditServerRequest(BaseModel):
     # fields can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    # None = keep current, otherwise overwrite (empty string clears it).
+    description: Optional[str] = None
+    # None = keep current, True/False = set explicitly.
+    allow_vovka: Optional[bool] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -636,6 +905,16 @@ class InstallProtocolRequest(BaseModel):
     tls_emulation: Optional[bool] = None
     tls_domain: Optional[str] = None
     max_connections: Optional[int] = None
+    # Telegram WEB proxy
+    webproxy_hostname: Optional[str] = None
+    webproxy_acme_email: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
+    webproxy_site_mode: Optional[str] = None
+    webproxy_site_name: Optional[str] = None
+    webproxy_site_tagline: Optional[str] = None
+    webproxy_site_upstream: Optional[str] = None
+    webproxy_max_profiles: Optional[int] = None
+    webproxy_skip_preflight: Optional[bool] = None
     # SOCKS5
     socks5_username: Optional[str] = None
     socks5_password: Optional[str] = None
@@ -660,6 +939,11 @@ class ProtocolRequest(BaseModel):
     protocol: str = 'awg'
 
 
+class BackupDownloadRequest(BaseModel):
+    protocol: str
+    filename: str
+
+
 class AddConnectionRequest(BaseModel):
     protocol: str = 'awg'
     name: str = 'Connection'
@@ -670,6 +954,8 @@ class AddConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class EditConnectionRequest(BaseModel):
@@ -681,6 +967,8 @@ class EditConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class ConnectionActionRequest(BaseModel):
@@ -713,6 +1001,8 @@ class AddUserRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 
@@ -754,6 +1044,17 @@ class TelegramSettings(BaseModel):
     enabled: bool = False
 
 
+class EmailSettings(BaseModel):
+    # SMTP credentials live only in data.json (not in env vars) so the admin
+    # can swap providers from the UI without rebuilding the container.
+    host: str = ''
+    port: int = 587
+    username: str = ''
+    password: str = ''
+    from_email: str = ''
+    from_name: str = ''
+    # "starttls" (587), "ssl" (465), or "none".
+    encryption: str = 'starttls'
 
 
 class UpdateUserRequest(BaseModel):
@@ -773,10 +1074,24 @@ class SaveSettingsRequest(BaseModel):
     captcha: CaptchaSettings
     telegram: TelegramSettings
     ssl: SSLSettings
+    email: Optional[EmailSettings] = None
 
 
 class ToggleUserRequest(BaseModel):
     enabled: bool
+
+
+class SendUserEmailRequest(BaseModel):
+    # IDs of user_connections to package as attachments.
+    connection_ids: List[str] = []
+    subject: Optional[str] = None
+    message: Optional[str] = None
+
+
+class EmailTestRequest(BaseModel):
+    # Optional recipient — defaults to the from_email if not given, so admins
+    # can send themselves a test without typing it.
+    to: Optional[str] = None
 
 
 class AddUserConnectionRequest(BaseModel):
@@ -790,6 +1105,8 @@ class AddUserConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    webproxy_secret: Optional[str] = None
+    webproxy_carrier_mode: Optional[str] = None
 
 
 class CreateApiTokenRequest(BaseModel):
@@ -811,6 +1128,14 @@ class ShareAuthRequest(BaseModel):
 async def startup():
     data = load_data()
     changed = False
+    # Persist server uids that load_data derived for pre-uid installs
+    raw_servers = []
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            raw_servers = json.load(f).get('servers') or []
+    if any(not s.get('uid') for s in raw_servers):
+        changed = True
+        logger.info("Assigned stable uids to servers")
     if not data.get('users'):
         data['users'] = [{
             'id': str(uuid.uuid4()),
@@ -885,7 +1210,7 @@ async def startup():
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
 
 
 def _scrape_server_traffic(server, sid, my_conns):
@@ -915,12 +1240,200 @@ def _scrape_server_traffic(server, sid, my_conns):
     return server_updates
 
 
+# ============================================================================
+# Server-country detection
+# ============================================================================
+# Each server card displays its hosting country (flag + code).  We resolve it
+# by hitting ip-api.com — free, no API key, accepts both IPs and hostnames,
+# 45 req/min limit (we're miles under that).  Results are cached in the
+# server dict (`country_code`, `country_name`, `country_checked_at`) and
+# refreshed lazily once per hour from the periodic background loop.
+
+COUNTRY_REFRESH_INTERVAL_SEC = 3600  # 1 hour
+
+# Bumped whenever the country-detection algorithm itself changes (e.g.
+# switching from inbound DNS-resolve to SSH+egress).  Servers with an
+# older version stamp get re-detected on the next loop tick regardless
+# of cache age — so admins don't have to wait for the cache to expire to
+# benefit from a logic fix.
+COUNTRY_DETECTION_VERSION = 2
+
+
+async def _lookup_country_by_ip(ip: str):
+    """Returns (country_code, country_name) for the given IP, or None on
+    failure (private range, network error, etc.). Never raises — country
+    info is decorative; a missing one shouldn't crash the loop."""
+    if not ip:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # `fields=...` keeps the response small and ip-api's per-query
+            # cost predictable.  `status` tells us success/fail without
+            # having to guess from missing keys.
+            r = await client.get(
+                f"http://ip-api.com/json/{ip}",
+                params={"fields": "status,countryCode,country,message"},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if data.get("status") != "success":
+                logger.debug(
+                    "country lookup for %s failed: %s",
+                    ip, data.get("message") or data,
+                )
+                return None
+            code = (data.get("countryCode") or "").strip().upper()
+            name = (data.get("country") or "").strip()
+            if not code:
+                return None
+            return code, name
+    except Exception as e:
+        logger.debug("country lookup for %s raised %s", ip, e)
+        return None
+
+
+# Endpoints we ask the server to call to discover its own outbound IP.
+# We try them in order so a single blocked / slow service can be skipped.
+_EGRESS_IP_PROBES = (
+    "curl -s --max-time 5 https://api.ipify.org",
+    "curl -s --max-time 5 https://ifconfig.me",
+    "curl -s --max-time 5 https://icanhazip.com",
+    "curl -s --max-time 5 https://ipv4.icanhazip.com",
+)
+
+
+def _looks_like_public_ip(s: str) -> bool:
+    """Cheap sanity filter on what curl returned — avoid feeding HTML error
+    pages or empty strings to ip-api."""
+    if not s or len(s) > 45 or ' ' in s or '<' in s:
+        return False
+    # Plausible IPv4 (a.b.c.d) or IPv6 (contains ':').
+    parts = s.split('.')
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return True
+    if ':' in s and all(c in '0123456789abcdefABCDEF:' for c in s):
+        return True
+    return False
+
+
+async def _resolve_server_country(srv: dict):
+    """Discover the SERVER's outbound public IP via SSH, then geolocate it.
+
+    Why SSH+egress rather than DNS-resolve the panel-known hostname:
+    the hostname admins enter (host / client_host) is the *inbound* address
+    — where clients dial in.  When the box sits behind a Mikrotik that
+    tunnels egress through another country (or behind a VPN, or any NAT
+    with non-trivial routing), the inbound IP can belong to a totally
+    different country than where the server's traffic actually exits the
+    internet.  For a VPN admin panel, what matters is the egress country
+    (that's what end-users will appear to browse from), not the inbound
+    one.  So we ask the server itself."""
+    def _ssh_get_egress_ip():
+        try:
+            ssh = get_ssh(srv)
+        except Exception:
+            return None
+        try:
+            ssh.connect()
+            for cmd in _EGRESS_IP_PROBES:
+                try:
+                    out, _, code = ssh.run_command(cmd)
+                except Exception:
+                    continue
+                ip = (out or "").strip().splitlines()[0].strip() if out else ""
+                if code == 0 and _looks_like_public_ip(ip):
+                    return ip
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+
+    egress_ip = await asyncio.to_thread(_ssh_get_egress_ip)
+    if not egress_ip:
+        return None
+    return await _lookup_country_by_ip(egress_ip)
+
+
+async def _refresh_stale_server_countries():
+    """Walk all servers, refresh `country_*` fields for those whose cache is
+    missing or older than COUNTRY_REFRESH_INTERVAL_SEC.  Detection is done
+    SSH→curl→ip-api so we report the server's *egress* country, not the
+    DNS-resolved inbound address (see _resolve_server_country docstring)."""
+    data = load_data()
+    now = datetime.now()
+    stale_indexes: list[int] = []
+    for idx, srv in enumerate(data.get("servers", [])):
+        # Algorithm-version mismatch → always re-check, even on fresh cache.
+        if srv.get("country_detection_version") != COUNTRY_DETECTION_VERSION:
+            stale_indexes.append(idx)
+            continue
+        checked_iso = srv.get("country_checked_at")
+        if checked_iso:
+            try:
+                last = datetime.fromisoformat(checked_iso)
+                if (now - last).total_seconds() < COUNTRY_REFRESH_INTERVAL_SEC:
+                    continue
+            except Exception:
+                pass  # malformed timestamp → treat as stale
+        stale_indexes.append(idx)
+
+    if not stale_indexes:
+        return
+
+    # Each lookup involves one SSH command + one ip-api call. Run them in
+    # parallel — N servers finish in roughly the time of the slowest one.
+    async def _resolve_one(idx):
+        srv = data["servers"][idx]
+        result = await _resolve_server_country(srv)
+        return idx, result
+
+    results = await asyncio.gather(*[_resolve_one(i) for i in stale_indexes])
+
+    async with DATA_LOCK:
+        curr = load_data()
+        servers = curr.get("servers", [])
+        for idx, result in results:
+            if idx >= len(servers):
+                continue
+            srv = servers[idx]
+            srv["country_checked_at"] = now.isoformat()
+            srv["country_detection_version"] = COUNTRY_DETECTION_VERSION
+            if result:
+                srv["country_code"], srv["country_name"] = result
+            else:
+                # Preserve the previous reading if we had one, but record
+                # that we tried — prevents tight retry loops on a host that
+                # just doesn't resolve.  Note: on schema-version bumps, we
+                # still REPLACE the version stamp above, so the next refresh
+                # won't keep re-trying on every loop tick.
+                srv.setdefault("country_code", "")
+                srv.setdefault("country_name", "")
+        save_data(curr)
+    logger.info(
+        "country sync refreshed %d server(s); known countries: %s",
+        len(stale_indexes),
+        [s.get("country_code") or "?" for s in servers],
+    )
+
+
 async def periodic_background_tasks():
     """Background task to sync traffic limits and Remnawave every 10 minutes"""
     while True:
         try:
             # We wait before the first sync to let the app settle
-            await asyncio.sleep(60) 
+            await asyncio.sleep(60)
+
+            # --- 0. SERVER COUNTRIES (cheap, runs every loop but only hits
+            # the network for entries whose cache is >1h old) ---
+            try:
+                await _refresh_stale_server_countries()
+            except Exception:
+                logger.exception("country sync failed (non-fatal)")
             
             # --- 1. TRAFFIC SYNC & LIMITS ---
             logger.info("Starting background traffic sync...")
@@ -1200,7 +1713,12 @@ async def api_add_server(request: Request, req: AddServerRequest):
             return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
 
         server = {
-            'name': name, 'host': host, 'ssh_port': req.ssh_port,
+            'uid': uuid.uuid4().hex,
+            'name': name, 'host': host,
+            'client_host': (req.client_host or '').strip(),
+            'description': (req.description or '').strip(),
+            'allow_vovka': bool(req.allow_vovka),
+            'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
             'protocols': {},
@@ -1256,6 +1774,13 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
 
         server['name'] = new_name
         server['host'] = new_host
+        # None = keep current, otherwise overwrite (empty string clears it).
+        if req.client_host is not None:
+            server['client_host'] = req.client_host.strip()
+        if req.description is not None:
+            server['description'] = req.description.strip()
+        if req.allow_vovka is not None:
+            server['allow_vovka'] = bool(req.allow_vovka)
         server['ssh_port'] = new_port
         server['username'] = new_user
         server['password'] = new_pass
@@ -1266,6 +1791,100 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
     except Exception as e:
         logger.exception("Error editing server")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/external/servers', tags=["External"])
+async def api_external_servers(request: Request, all_servers: bool = Query(default=False, alias='all')):
+    """Server list filtered for external bots.
+
+    Only servers with `allow_vovka = True` are returned (`?all=1` — every
+    server, with the `allow_vovka` flag: Vovka also issues proxies from
+    per-company servers that are not in its common pool), and the response
+    deliberately omits SSH credentials and any other field a third-party
+    bot has no business knowing. Use a Bearer API token (Settings → API
+    Tokens in the admin UI) — admin-equivalent rights, same auth path as
+    every other privileged endpoint, just narrower output.
+
+    Returns `id` (the panel's stable integer index — use it when calling
+    any other /api/servers/{server_id}/... endpoint), display info, the
+    set of installed VPN protocols, and the cached country flag/code if
+    geo-detection has run."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    data = load_data()
+    out = []
+    for idx, srv in enumerate(data.get('servers', []) or []):
+        if not all_servers and not srv.get('allow_vovka'):
+            continue
+        # Only protocols actually deployed — saves the caller from filtering
+        # later and avoids leaking which extras were tried-and-removed.
+        installed = [
+            p for p, info in (srv.get('protocols') or {}).items()
+            if isinstance(info, dict) and info.get('installed')
+        ]
+        out.append({
+            'id': idx,
+            'uid': srv.get('uid') or '',
+            'name': srv.get('name') or srv.get('host') or '',
+            'host': srv.get('host') or '',
+            'client_host': srv.get('client_host') or '',
+            'description': srv.get('description') or '',
+            'country_code': srv.get('country_code') or '',
+            'country_name': srv.get('country_name') or '',
+            'protocols': installed,
+            'allow_vovka': bool(srv.get('allow_vovka')),
+        })
+    return {'servers': out}
+
+
+# Telegram proxies Vovka tracks; other protocols are not its business
+EXTERNAL_PROXY_PROTOCOLS = ('telemt', 'webproxy')
+
+
+@app.get('/api/external/proxies', tags=["External"])
+async def api_external_proxies(request: Request):
+    """Every Telegram proxy (telemt / webproxy) assigned to a panel user, in one call.
+
+    Vovka syncs its registry against this: the panel is the source of truth.
+    Only connections bound to a user (user_connections) are returned; no
+    secrets, links or SSH data. `server_uid` is stable, `server_id` is the
+    current list index (it shifts when servers are reordered or deleted).
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    data = load_data()
+    servers = data.get('servers', []) or []
+    conns = []
+    user_ids = set()
+    for c in data.get('user_connections', []) or []:
+        if c.get('protocol') not in EXTERNAL_PROXY_PROTOCOLS:
+            continue
+        sid = c.get('server_id')
+        srv = servers[sid] if isinstance(sid, int) and 0 <= sid < len(servers) else {}
+        conns.append({
+            'id': c.get('id'),
+            'user_id': c.get('user_id'),
+            'protocol': c.get('protocol'),
+            'client_id': c.get('client_id'),
+            'name': c.get('name') or '',
+            'created_at': c.get('created_at') or '',
+            'server_id': sid,
+            'server_uid': srv.get('uid') or '',
+            'server_name': srv.get('name') or srv.get('host') or '',
+        })
+        user_ids.add(c.get('user_id'))
+    users = [{
+        'id': u['id'],
+        'username': u.get('username') or '',
+        'telegramId': u.get('telegramId'),
+        'email': u.get('email'),
+        'description': u.get('description'),
+        'enabled': u.get('enabled', True),
+        'created_at': u.get('created_at') or '',
+    } for u in data.get('users', []) or [] if u.get('id') in user_ids]
+    return {'users': users, 'connections': conns}
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])
@@ -1506,8 +2125,11 @@ async def api_check_server(request: Request, server_id: int):
             except Exception as e:
                 return proto, None, str(e)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
+        # Kept below sshd's default MaxSessions (10): every probe opens its own
+        # exec channel on the one connection, and going wider makes the server
+        # refuse channels ("Secsh channel N open FAILED") for random protocols.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'dns', 'wireguard', 'socks5', 'adguard']]
             for future in concurrent.futures.as_completed(futures):
                 proto, result, err = future.result()
                 if err:
@@ -1545,7 +2167,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']:
+        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'webproxy', 'dns', 'wireguard', 'socks5', 'adguard']:
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
 
         server = data['servers'][server_id]
@@ -1561,6 +2183,19 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
                 tls_domain=req.tls_domain,
                 max_connections=req.max_connections if req.max_connections is not None else 0
+            )
+        elif req.protocol == 'webproxy':
+            result = manager.install_protocol(
+                protocol_type='webproxy',
+                hostname=req.webproxy_hostname or '',
+                acme_email=req.webproxy_acme_email or '',
+                carrier_mode=req.webproxy_carrier_mode or 'https',
+                site_mode=req.webproxy_site_mode or 'generated',
+                site_name=req.webproxy_site_name or '',
+                site_tagline=req.webproxy_site_tagline or '',
+                site_upstream=req.webproxy_site_upstream or '',
+                max_profiles=req.webproxy_max_profiles or 128,
+                skip_preflight=bool(req.webproxy_skip_preflight),
             )
         elif req.protocol == 'xray':
             result = manager.install_protocol(port=req.port)
@@ -1686,17 +2321,142 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+# Protocols whose "container" is really a stack: start/stop must move all of
+# them together, or the WEB proxy is left half-up (Caddy serving errors on
+# every path while the relay is down).
+STACK_CONTAINERS = {
+    'webproxy': ['amnezia-webproxy-caddy', 'amnezia-webproxy', 'amnezia-webproxy-mtp'],
+}
+
 CONTAINER_NAMES = {
     'awg': 'amnezia-awg',
     'awg2': 'amnezia-awg2',
     'awg_legacy': 'amnezia-awg-legacy',
     'xray': 'amnezia-xray',
     'telemt': 'telemt',
+    'webproxy': 'amnezia-webproxy',
     'dns': 'amnezia-dns',
     'wireguard': 'amnezia-wireguard',
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
 }
+
+
+@app.post('/api/servers/{server_id}/backups', tags=["Protocols"])
+async def api_protocol_backups_list(request: Request, server_id: int, req: ProtocolRequest):
+    """List backups created on the remote server for one protocol."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.protocol not in CONTAINER_NAMES:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        result = BackupManager(ssh).list_backups(req.protocol)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to list backups')}, status_code=500)
+        return result
+    except Exception as e:
+        logger.exception("Error listing protocol backups")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/create', tags=["Protocols"])
+async def api_protocol_backup_create(request: Request, server_id: int, req: ProtocolRequest):
+    """Create a protocol backup archive on the remote server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    container = CONTAINER_NAMES.get(req.protocol)
+    if not container:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        # Archiving can take a while on a busy server, so keep it off the event loop.
+        result = await asyncio.to_thread(BackupManager(ssh).create_backup, req.protocol, container)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to create backup')}, status_code=500)
+        return result
+    except Exception as e:
+        logger.exception("Error creating protocol backup")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/download', tags=["Protocols"])
+async def api_protocol_backup_download(request: Request, server_id: int, req: BackupDownloadRequest):
+    """Download one remote protocol backup archive through the panel."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.protocol not in CONTAINER_NAMES:
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    manager = BackupManager(None)
+    safe_proto = manager.safe_protocol(req.protocol)
+    filename = manager.safe_filename(req.filename)
+    if not filename:
+        return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
+    ssh = None
+    tmp_path = None
+    tmp_remote = f'/tmp/{filename}'
+    remote_path = f'{manager.BACKUP_ROOT}/{safe_proto}/{filename}'
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        quoted_remote = shlex.quote(remote_path)
+        quoted_tmp = shlex.quote(tmp_remote)
+        # Copy to /tmp and relax the mode first: the archive is written with
+        # umask 077 under root, so SFTP as a non-root login can't read it.
+        _, err, code = ssh.run_sudo_command(
+            f"sh -c {shlex.quote(f'test -f {quoted_remote} && cp {quoted_remote} {quoted_tmp} && chmod 0644 {quoted_tmp}')}"
+        )
+        if code != 0:
+            return JSONResponse({'error': err or 'Backup not found'}, status_code=404)
+        fd, tmp_path = tempfile.mkstemp(prefix='amnezia-backup-', suffix='.tar.gz')
+        os.close(fd)
+        sftp = ssh.client.open_sftp()
+        try:
+            sftp.get(tmp_remote, tmp_path)
+        finally:
+            sftp.close()
+            ssh.run_sudo_command(f"rm -f {quoted_tmp}")
+            ssh.disconnect()
+            ssh = None
+        return FileResponse(
+            tmp_path,
+            media_type='application/gzip',
+            filename=filename,
+            background=BackgroundTask(lambda p=tmp_path: os.path.exists(p) and os.remove(p)),
+        )
+    except Exception as e:
+        logger.exception("Error downloading protocol backup")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/container/toggle', tags=["Protocols"])
@@ -1719,11 +2479,16 @@ async def api_container_toggle(request: Request, server_id: int, req: ProtocolRe
             f"docker inspect -f '{{{{.State.Running}}}}' {container} 2>/dev/null"
         )
         is_running = out.strip().lower() == 'true'
+        # Stop the front first and start it last, so the hostname never answers
+        # while its backend is missing.
+        stack = STACK_CONTAINERS.get(req.protocol, [container])
         if is_running:
-            ssh.run_sudo_command(f"docker stop {container}")
+            for name in stack:
+                ssh.run_sudo_command(f"docker stop {name}")
             action = 'stopped'
         else:
-            ssh.run_sudo_command(f"docker start {container}")
+            for name in reversed(stack):
+                ssh.run_sudo_command(f"docker start {name}")
             action = 'started'
         ssh.disconnect()
         return {'status': 'success', 'action': action, 'container': container}
@@ -1753,6 +2518,10 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         elif req.protocol == 'telemt':
             from managers.telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
+            config = mgr._get_server_config()
+        elif req.protocol == 'webproxy':
+            from managers.webproxy_manager import WebProxyManager
+            mgr = WebProxyManager(ssh)
             config = mgr._get_server_config()
         elif req.protocol == 'wireguard':
             from managers.wireguard_manager import WireGuardManager
@@ -1794,6 +2563,10 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
             from managers.telemt_manager import TelemtManager
             mgr = TelemtManager(ssh)
             mgr.save_server_config(req.protocol, req.config)
+        elif req.protocol == 'webproxy':
+            from managers.webproxy_manager import WebProxyManager
+            mgr = WebProxyManager(ssh)
+            mgr.save_server_config(req.protocol, req.config)
         elif req.protocol == 'wireguard':
             from managers.wireguard_manager import WireGuardManager
             mgr = WireGuardManager(ssh)
@@ -1803,6 +2576,12 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
             mgr.save_server_config(req.protocol, req.config)
         ssh.disconnect()
         return {'status': 'success'}
+    except ValueError as e:
+        # Config failed validation (e.g. Telemt username that TOML would read
+        # as a table) -- the config was never written, so this is bad input,
+        # not a server fault.
+        logger.warning("Rejected invalid server config: %s", e)
+        return JSONResponse({'error': str(e)}, status_code=400)
     except Exception as e:
         logger.exception("Error saving server config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -1864,7 +2643,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         
         if req.protocol == 'telemt':
             result = manager.add_client(
-                req.protocol, req.name, server['host'], port,
+                req.protocol, req.name, get_client_host(server), port,
                 telemt_quota=req.telemt_quota,
                 telemt_max_ips=req.telemt_max_ips,
                 telemt_expiry=req.telemt_expiry,
@@ -1872,14 +2651,21 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
                 user_ad_tag=req.telemt_ad_tag,
                 max_tcp_conns=req.telemt_max_conns
             )
+        elif req.protocol == 'webproxy':
+            result = manager.add_client(
+                req.protocol, req.name, get_client_host(server), port,
+                secret=req.webproxy_secret,
+                carrier_mode=req.webproxy_carrier_mode,
+            )
         elif req.protocol == 'wireguard':
-            result = manager.add_client(req.name, server['host'])
+            result = manager.add_client(req.name, get_client_host(server))
         else:
-            result = manager.add_client(req.protocol, req.name, server['host'], port)
+            result = manager.add_client(req.protocol, req.name, get_client_host(server), port)
         ssh.disconnect()
 
         if result.get('config'):
-            result['vpn_link'] = generate_vpn_link(result['config'])
+            result['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
+            result['qr_chunks'] = generate_vpn_qr_chunks(result['config'], req.protocol)
 
         # Link connection to user if specified
         if req.user_id and result.get('client_id'):
@@ -1951,7 +2737,10 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             edit_params['secret'] = req.telemt_secret
             edit_params['user_ad_tag'] = req.telemt_ad_tag
             edit_params['max_tcp_conns'] = req.telemt_max_conns
-            
+        elif req.protocol == 'webproxy':
+            edit_params['secret'] = req.webproxy_secret
+            edit_params['carrier_mode'] = req.webproxy_carrier_mode
+
         result = manager.edit_client(req.protocol, req.client_id, edit_params)
         ssh.disconnect()
         return result
@@ -1986,12 +2775,13 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         if req.protocol == 'wireguard':
-            config = manager.get_client_config(req.client_id, server['host'])
+            config = manager.get_client_config(req.client_id, get_client_host(server))
         else:
-            config = manager.get_client_config(req.protocol, req.client_id, server['host'], port)
+            config = manager.get_client_config(req.protocol, req.client_id, get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        vpn_link = generate_vpn_link(config, req.protocol) if config else ''
+        qr_chunks = generate_vpn_qr_chunks(config, req.protocol) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2035,13 +2825,19 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
     search = search.lower()
     for u in all_users:
         if search:
-            match = (search in u['username'].lower() or 
-                     (u.get('email') and search in u['email'].lower()) or 
+            match = (search in u['username'].lower() or
+                     (u.get('email') and search in u['email'].lower()) or
                      (u.get('telegramId') and search in str(u['telegramId']).lower()))
             if not match:
                 continue
         filtered.append(u)
-        
+
+    # Newest-first ordering: admins almost always want to see who they just
+    # added at the top.  Sorting by ISO created_at strings is correct because
+    # the format is lexicographically sortable; users that pre-date the field
+    # have empty strings and naturally end up at the bottom under reverse=True.
+    filtered.sort(key=lambda u: u.get('created_at') or '', reverse=True)
+
     total = len(filtered)
     start = (page - 1) * size
     end = start + size
@@ -2079,8 +2875,10 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
 
 @app.post('/api/users/add', tags=["Users"])
 async def api_add_user(request: Request, req: AddUserRequest):
-    cur = get_current_user(request)
-    if not cur or cur['role'] != 'admin':
+    # Принимаем session admin/support либо Bearer-токен (внешний бот, e.g. Вовка).
+    # Согласовано с соседними /api/users/{user_id}/{update,delete,toggle} —
+    # везде через _check_admin (admin/support). Bearer admin-equivalent по дизайну.
+    if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
@@ -2128,7 +2926,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                 manager = get_protocol_manager(ssh, req.protocol)
                 if req.protocol == 'telemt':
                     conn_result = manager.add_client(
-                        req.protocol, conn_name, server['host'], port,
+                        req.protocol, conn_name, get_client_host(server), port,
                         telemt_quota=req.telemt_quota,
                         telemt_max_ips=req.telemt_max_ips,
                         telemt_expiry=req.telemt_expiry,
@@ -2136,8 +2934,14 @@ async def api_add_user(request: Request, req: AddUserRequest):
                         user_ad_tag=req.telemt_ad_tag,
                         max_tcp_conns=req.telemt_max_conns
                     )
+                elif req.protocol == 'webproxy':
+                    conn_result = manager.add_client(
+                        req.protocol, conn_name, get_client_host(server), port,
+                        secret=req.webproxy_secret,
+                        carrier_mode=req.webproxy_carrier_mode,
+                    )
                 else:
-                    conn_result = manager.add_client(req.protocol, conn_name, server['host'], port)
+                    conn_result = manager.add_client(req.protocol, conn_name, get_client_host(server), port)
                 ssh.disconnect()
 
                 if conn_result.get('client_id'):
@@ -2156,7 +2960,8 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     result['connection_created'] = True
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
-                        result['vpn_link'] = generate_vpn_link(conn_result['config'])
+                        result['vpn_link'] = generate_vpn_link(conn_result['config'], req.protocol)
+                        result['qr_chunks'] = generate_vpn_qr_chunks(conn_result['config'], req.protocol)
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -2263,13 +3068,13 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(manager.get_client_config, req.protocol, req.client_id, server['host'], port)
+            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, get_client_host(server), port)
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
             if req.protocol == 'telemt':
                 result = await asyncio.to_thread(
-                    manager.add_client, req.protocol, req.name, server['host'], port,
+                    manager.add_client, req.protocol, req.name, get_client_host(server), port,
                     telemt_quota=req.telemt_quota,
                     telemt_max_ips=req.telemt_max_ips,
                     telemt_expiry=req.telemt_expiry,
@@ -2277,8 +3082,14 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                     user_ad_tag=req.telemt_ad_tag,
                     max_tcp_conns=req.telemt_max_conns
                 )
+            elif req.protocol == 'webproxy':
+                result = await asyncio.to_thread(
+                    manager.add_client, req.protocol, req.name, get_client_host(server), port,
+                    secret=req.webproxy_secret,
+                    carrier_mode=req.webproxy_carrier_mode,
+                )
             else:
-                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, server['host'], port)
+                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, get_client_host(server), port)
         
         await asyncio.to_thread(ssh.disconnect)
 
@@ -2299,7 +3110,8 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         resp = {'status': 'success'}
         if result.get('config'):
             resp['config'] = result['config']
-            resp['vpn_link'] = generate_vpn_link(result['config'])
+            resp['vpn_link'] = generate_vpn_link(result['config'], req.protocol)
+            resp['qr_chunks'] = generate_vpn_qr_chunks(result['config'], req.protocol)
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
@@ -2308,12 +3120,15 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
 async def api_get_user_connections(request: Request, user_id: str):
+    # Self-service путь: session-user типа 'user' видит только свои.
     user = get_current_user(request)
-    if not user:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    # Users can only see their own, admin/support can see all
-    if user['role'] == 'user' and user['id'] != user_id:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if user and user['role'] == 'user':
+        if user['id'] != user_id:
+            return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    else:
+        # Admin/support session или Bearer-токен (внешний бот) — доступ к любым.
+        if not _check_admin(request):
+            return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
     for c in conns:
@@ -2321,6 +3136,310 @@ async def api_get_user_connections(request: Request, user_id: str):
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
     return {'connections': conns}
+
+
+def _fetch_connection_payload(data: dict, conn: dict) -> dict:
+    """Pull the freshly generated config (and matching vpn:// link) for a single
+    user_connections record. Returns dict with `config`, `vpn_link`, `protocol`,
+    `server`, `connection`. Raises on SSH/protocol errors so the caller can log
+    and skip a single broken connection without aborting the whole email."""
+    sid = conn['server_id']
+    if sid >= len(data['servers']):
+        raise RuntimeError(f"Server {sid} no longer exists")
+    server = data['servers'][sid]
+    proto_info = server.get('protocols', {}).get(conn['protocol'], {})
+    port = proto_info.get('port', '55424')
+    ssh = get_ssh(server)
+    ssh.connect()
+    try:
+        manager = get_protocol_manager(ssh, conn['protocol'])
+        config = _manager_call(
+            manager, 'get_client_config',
+            conn['protocol'], conn['client_id'], get_client_host(server), port
+        )
+    finally:
+        ssh.disconnect()
+    vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
+    return {
+        'config': config or '',
+        'vpn_link': vpn_link,
+        'protocol': conn['protocol'],
+        'server': server,
+        'connection': conn,
+    }
+
+
+def _qr_cid_for_connection(conn: dict) -> str:
+    """Stable Content-ID for the connection's inline QR — used by both the
+    attachment builder (to set Content-ID on the part) and the HTML body
+    (to write src="cid:..."), so they refer to the same image."""
+    return f"qr-{conn.get('id', 'unknown')}"
+
+
+def _build_email_attachments_for_connection(payload: dict) -> List[EmailAttachment]:
+    """Pack one connection into MIME parts:
+       - <name>.conf if the protocol uses an INI-style WireGuard config
+         (regular file attachment — user downloads/imports)
+       - PNG QR encoding either the vpn:// link (AmneziaWG, where the link is
+         scannable by the official client) or the raw config/URL otherwise.
+         Marked inline so it renders right next to its name in the HTML body."""
+    attachments: List[EmailAttachment] = []
+    conn = payload['connection']
+    protocol = payload['protocol']
+    config = payload['config']
+    vpn_link = payload['vpn_link']
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', conn.get('name') or 'vpn') or 'vpn'
+
+    # INI-style protocols → ship the actual .conf so users can import via file.
+    if protocol in ('awg', 'awg2', 'awg_legacy', 'wireguard') and config:
+        attachments.append(EmailAttachment(
+            filename=f"{safe_name}.conf",
+            content=config.encode('utf-8'),
+            mime_main='text', mime_sub='plain',
+        ))
+
+    # QR target depends on what scanner the user will point at it.
+    # For AWG/AWG2 the official Amnezia client expects the native vpn:// link
+    # (we already build it with the Qt qCompress wrapper in generate_vpn_link).
+    # For everything else the QR holds the raw config/URL — which is exactly
+    # what WireGuard / Xray / Telegram client scanners want.
+    qr_text = vpn_link if protocol in ('awg', 'awg2') and vpn_link else (config or vpn_link)
+    if qr_text:
+        try:
+            png = render_qr_png(qr_text)
+            attachments.append(EmailAttachment(
+                filename=f"{safe_name}.png",
+                content=png,
+                mime_main='image', mime_sub='png',
+                inline=True,
+                content_id=_qr_cid_for_connection(conn),
+            ))
+        except Exception:
+            logger.exception("Failed to render QR PNG for connection %s", conn.get('id'))
+
+    return attachments
+
+
+def _build_email_body_html(panel_user: dict, payloads: List[dict], custom_message: str) -> str:
+    """HTML body with one card per connection, each containing the connection
+    name, server, protocol, copyable link, and an inline QR (≤ ~5×5 cm).
+
+    QR images are referenced by cid:<id> — those parts are added as inline
+    related resources in `_build_email_attachments_for_connection`."""
+    import html as _html
+
+    def esc(s):
+        return _html.escape(str(s or ''))
+
+    greeting = esc(panel_user.get('username') or 'there')
+    parts: List[str] = []
+    parts.append(
+        '<!doctype html><html><body style="margin:0; padding:16px; '
+        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif; '
+        'color:#222; background:#fafafa;">'
+    )
+    parts.append(f'<div style="max-width:620px; margin:0 auto;">')
+    parts.append(f'<p style="margin:0 0 12px;">Hi <b>{greeting}</b>,</p>')
+    if custom_message:
+        # User-provided free text — keep newlines, escape HTML.
+        msg_html = esc(custom_message).replace('\n', '<br>')
+        parts.append(
+            f'<div style="background:#fff; border:1px solid #e5e5e5; border-radius:8px; '
+            f'padding:12px; margin:0 0 16px; white-space:normal;">{msg_html}</div>'
+        )
+    parts.append(
+        f'<p style="margin:0 0 12px; color:#444;">You have '
+        f'<b>{len(payloads)}</b> VPN configuration(s):</p>'
+    )
+
+    for p in payloads:
+        conn = p['connection']
+        server = p['server']
+        proto = p['protocol']
+        proto_label = {
+            'awg': 'AmneziaWG', 'awg2': 'AmneziaWG 2.0', 'awg_legacy': 'AmneziaWG Legacy',
+            'wireguard': 'WireGuard', 'xray': 'Xray', 'telemt': 'Telemt (Telegram)',
+            'webproxy': 'Telegram WEB Proxy',
+        }.get(proto, proto)
+        server_label = server.get('name') or server.get('host') or '?'
+        link_block = ''
+        if proto in ('xray', 'telemt', 'webproxy'):
+            if p['config']:
+                link_block = (
+                    f'<div style="margin:8px 0 4px; font-size:12px; color:#666;">Link:</div>'
+                    f'<div style="font-family:Menlo,Consolas,monospace; word-break:break-all; '
+                    f'background:#f5f5f5; padding:8px; border-radius:4px; font-size:11px;">'
+                    f'{esc(p["config"])}</div>'
+                )
+        else:
+            if p['vpn_link']:
+                link_block = (
+                    f'<div style="margin:8px 0 4px; font-size:12px; color:#666;">VPN deep-link '
+                    f'(tap to import on mobile):</div>'
+                    f'<div style="font-family:Menlo,Consolas,monospace; word-break:break-all; '
+                    f'background:#f5f5f5; padding:8px; border-radius:4px; font-size:11px;">'
+                    f'<a href="{esc(p["vpn_link"])}" style="color:#333; text-decoration:none;">'
+                    f'{esc(p["vpn_link"])}</a></div>'
+                )
+
+        cid = _qr_cid_for_connection(conn)
+        parts.append(
+            '<div style="background:#fff; border:1px solid #e5e5e5; border-radius:10px; '
+            'padding:14px 16px; margin:0 0 14px;">'
+            f'  <div style="font-size:16px; font-weight:600; margin:0 0 4px;">{esc(conn.get("name") or "connection")}</div>'
+            f'  <div style="font-size:12px; color:#777; margin:0 0 8px;">'
+            f'    {esc(server_label)} &middot; {esc(proto_label)}'
+            f'  </div>'
+            f'  {link_block}'
+            # QR pinned to 270×270 px (~7 cm at 96dpi) — comfortable scan size
+            # without dominating the email card.
+            f'  <div style="text-align:center; margin:12px 0 4px;">'
+            f'    <img src="cid:{esc(cid)}" alt="QR for {esc(conn.get("name") or "config")}" '
+            f'         width="270" height="270" '
+            f'         style="width:270px; height:270px; max-width:7.5cm; max-height:7.5cm; '
+            f'                display:inline-block; border:1px solid #eee; border-radius:4px;">'
+            f'  </div>'
+            f'  <div style="text-align:center; font-size:11px; color:#999;">'
+            f'    Scan in your VPN app'
+            f'  </div>'
+            '</div>'
+        )
+
+    parts.append(
+        '<p style="margin:16px 0 4px; color:#666; font-size:12px;">'
+        '.conf files (if applicable) are attached separately — import them directly into '
+        'the VPN client if scanning is inconvenient.'
+        '</p>'
+        '<p style="margin:4px 0 0; color:#999; font-size:11px;">— Amnezia Web Panel</p>'
+    )
+    parts.append('</div></body></html>')
+    return ''.join(parts)
+
+
+def _build_email_body(panel_user: dict, payloads: List[dict], custom_message: str) -> str:
+    """Plain-text email body summarising each connection with copy-friendly
+    link/snippet. We keep it text-only (no HTML) so it renders the same in
+    every mail client and the attachments do the heavy lifting."""
+    lines: List[str] = []
+    greeting_name = panel_user.get('username') or 'there'
+    lines.append(f"Hi {greeting_name},")
+    lines.append("")
+    if custom_message:
+        lines.append(custom_message.strip())
+        lines.append("")
+    lines.append(f"You have {len(payloads)} VPN configuration(s) attached:")
+    lines.append("")
+    for i, p in enumerate(payloads, 1):
+        conn = p['connection']
+        server = p['server']
+        proto = p['protocol']
+        server_label = server.get('name') or server.get('host') or '?'
+        lines.append(f"{i}. {conn.get('name') or 'connection'}")
+        lines.append(f"   Server: {server_label}")
+        lines.append(f"   Protocol: {proto}")
+        if proto in ('xray', 'telemt', 'webproxy'):
+            # URI-style protocols: the config IS the link, paste it into the app.
+            if p['config']:
+                lines.append(f"   Link: {p['config']}")
+        else:
+            # INI protocols: the .conf attachment is the import target, plus
+            # the vpn:// link for one-tap import on mobile where supported.
+            if p['vpn_link']:
+                lines.append(f"   VPN deep-link: {p['vpn_link']}")
+        lines.append("")
+    lines.append("Scan the attached QR with your VPN app, or import the .conf file directly.")
+    lines.append("")
+    lines.append("— Amnezia Web Panel")
+    return "\n".join(lines)
+
+
+@app.post('/api/users/{user_id}/email/send', tags=["Users"])
+async def api_send_user_email(request: Request, user_id: str, req: SendUserEmailRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.connection_ids:
+        return JSONResponse({'error': 'Select at least one connection'}, status_code=400)
+
+    data = load_data()
+    panel_user = next((u for u in data.get('users', []) if u['id'] == user_id), None)
+    if not panel_user:
+        return JSONResponse({'error': 'User not found'}, status_code=404)
+    to_email = (panel_user.get('email') or '').strip()
+    if not to_email:
+        return JSONResponse({'error': 'User has no email address on file'}, status_code=400)
+
+    smtp = SMTPSettings.from_dict(data.get('settings', {}).get('email', {}) or {})
+    if not smtp.is_configured():
+        return JSONResponse({'error': 'SMTP is not configured (open Settings → Email)'}, status_code=400)
+
+    # Only allow connections belonging to *this* user — defense against an
+    # admin (or compromised session) passing arbitrary connection IDs.
+    user_conns = {c['id']: c for c in data.get('user_connections', []) if c['user_id'] == user_id}
+    requested = [user_conns[cid] for cid in req.connection_ids if cid in user_conns]
+    if not requested:
+        return JSONResponse({'error': 'None of the requested connections belong to this user'}, status_code=400)
+
+    # Pull every config in a thread to avoid blocking the event loop on SSH.
+    payloads: List[dict] = []
+    failures: List[str] = []
+    for conn in requested:
+        try:
+            payload = await asyncio.to_thread(_fetch_connection_payload, data, conn)
+            payloads.append(payload)
+        except Exception as e:
+            logger.exception("Email: failed to fetch config for connection %s", conn.get('id'))
+            failures.append(f"{conn.get('name') or conn.get('id')}: {e}")
+
+    if not payloads:
+        return JSONResponse(
+            {'error': 'Could not fetch any of the selected configs', 'details': failures},
+            status_code=502,
+        )
+
+    attachments: List[EmailAttachment] = []
+    for p in payloads:
+        attachments.extend(_build_email_attachments_for_connection(p))
+
+    subject = (req.subject or '').strip() or 'Your VPN configuration'
+    custom = (req.message or '').strip()
+    body = _build_email_body(panel_user, payloads, custom)
+    html_body = _build_email_body_html(panel_user, payloads, custom)
+
+    ok, msg = await smtp_send_email(smtp, to_email, subject, body, attachments, html_body=html_body)
+    if not ok:
+        return JSONResponse({'error': f'SMTP failed: {msg}', 'partial_failures': failures}, status_code=502)
+
+    return {
+        'status': 'sent',
+        'to': to_email,
+        'sent_count': len(payloads),
+        'attachments': len(attachments),
+        'failed_connections': failures,
+    }
+
+
+@app.post('/api/settings/email/test', tags=["Settings"])
+async def api_email_test(request: Request, req: EmailTestRequest):
+    """Send a no-attachment test message using the current SMTP settings.
+    Lets the admin verify creds without picking a user and connections."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    smtp = SMTPSettings.from_dict(data.get('settings', {}).get('email', {}) or {})
+    if not smtp.is_configured():
+        return JSONResponse({'error': 'SMTP is not configured'}, status_code=400)
+    to = (req.to or smtp.from_email or '').strip()
+    if not to:
+        return JSONResponse({'error': 'No recipient: set "to" or configure from_email'}, status_code=400)
+    ok, msg = await smtp_send_email(
+        smtp, to,
+        subject='Amnezia Web Panel — SMTP test',
+        body='This is a test message confirming that SMTP settings are correct.\n',
+        attachments=[],
+    )
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=502)
+    return {'status': 'sent', 'to': to}
 
 
 # ======================== MY CONNECTIONS API (for user role) ========================
@@ -2440,10 +3559,11 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         ssh.connect()
         # Use appropriate manager for the protocol
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], server['host'], port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
+        qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting shared config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2472,10 +3592,11 @@ async def api_my_connection_config(request: Request, connection_id: str):
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = manager.get_client_config(conn['protocol'], conn['client_id'], server['host'], port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], get_client_host(server), port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        vpn_link = generate_vpn_link(config, conn['protocol']) if config else ''
+        qr_chunks = generate_vpn_qr_chunks(config, conn['protocol']) if config else []
+        return {'config': config, 'vpn_link': vpn_link, 'qr_chunks': qr_chunks}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2522,15 +3643,25 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data['settings']['captcha'] = payload.captcha.dict()
     data['settings']['telegram'] = payload.telegram.dict()
     data['settings']['ssl'] = payload.ssl.dict()
+    if payload.email is not None:
+        # Don't blindly overwrite the password on every save: if the UI sent
+        # back an empty string and we already have one stored, preserve it.
+        # The form leaves the password input empty after save for security
+        # (a non-empty value means "rotate to this new password").
+        new_email = payload.email.dict()
+        current = data['settings'].get('email', {}) or {}
+        if not new_email.get('password') and current.get('password'):
+            new_email['password'] = current['password']
+        data['settings']['email'] = new_email
     save_data(data)
-    logger.info("Settings saved (including captcha and telegram)")
+    logger.info("Settings saved (including captcha, telegram, email)")
 
     # Handle bot start/stop based on new telegram settings
     tg_cfg = payload.telegram
     if tg_cfg.enabled and tg_cfg.token:
         if not tg_bot.is_running():
             logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link)
+            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data)
     else:
         if tg_bot.is_running():
             logger.info("Stopping Telegram bot (settings save)...")
@@ -2557,7 +3688,7 @@ async def api_telegram_toggle(request: Request):
         save_data(data)
         return {'status': 'stopped', 'bot_running': False}
     else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link)
+        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data)
         tg_cfg['enabled'] = True
         data['settings']['telegram'] = tg_cfg
         save_data(data)

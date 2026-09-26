@@ -5,6 +5,8 @@ import re
 import os
 import secrets
 from datetime import datetime
+from .docker_utils import ensure_docker_compose
+from .naming import is_safe_key, transliterate
 from .ssh_manager import SSHManager
 
 logger = logging.getLogger(__name__)
@@ -12,7 +14,17 @@ logger = logging.getLogger(__name__)
 class TelemtManager:
     CONTAINER_NAME = "telemt"
     API_URL = "http://127.0.0.1:9091"
-    
+    CONFIG_PATH = "/opt/amnezia/telemt/config.toml"
+    # Sections whose keys are usernames (and therefore must be safe TOML bare keys).
+    USER_KEYED_SECTIONS = (
+        "access.users",
+        "access.user_data_quota",
+        "access.user_max_unique_ips",
+        "access.user_expirations",
+        "access.user_ad_tags",
+        "access.user_max_tcp_conns",
+    )
+
     def __init__(self, ssh_manager: SSHManager):
         self.ssh = ssh_manager
 
@@ -69,63 +81,8 @@ class TelemtManager:
         return status
 
     def _ensure_docker_compose(self):
-        """Make sure `docker compose` is available, installing the plugin if needed.
-
-        Why: `docker-buildx-plugin` and `docker-compose-plugin` only ship in Docker's
-        official apt/yum repo. When Docker was installed from distro packages
-        (e.g. `docker.io` on Ubuntu), that repo is not configured and a plain
-        `apt-get install docker-compose-plugin` fails. So we add the repo,
-        refresh package lists, then install.
-        """
-        out, _, code = self.ssh.run_command("docker compose version 2>/dev/null")
-        if code == 0 and out.strip():
-            return
-
-        script = r"""
-if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || true
-    apt-get install -y ca-certificates curl gnupg || exit 1
-    install -m 0755 -d /etc/apt/keyrings
-    . /etc/os-release
-    DOCKER_DISTRO="$ID"
-    case "$ID" in
-        linuxmint|pop|elementary|zorin) DOCKER_DISTRO="ubuntu" ;;
-        kali|parrot) DOCKER_DISTRO="debian" ;;
-    esac
-    if [ ! -s /etc/apt/keyrings/docker.asc ]; then
-        curl -fsSL "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" -o /etc/apt/keyrings/docker.asc || exit 1
-        chmod a+r /etc/apt/keyrings/docker.asc
-    fi
-    CODENAME="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} ${CODENAME} stable" > /etc/apt/sources.list.d/docker.list
-    apt-get update -y || exit 1
-    apt-get install -y docker-buildx-plugin docker-compose-plugin || exit 1
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y dnf-plugins-core || exit 1
-    . /etc/os-release
-    dnf config-manager --add-repo "https://download.docker.com/linux/${ID}/docker-ce.repo" \
-        || dnf config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" \
-        || exit 1
-    dnf makecache || true
-    dnf install -y docker-buildx-plugin docker-compose-plugin || exit 1
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y yum-utils || exit 1
-    . /etc/os-release
-    yum-config-manager --add-repo "https://download.docker.com/linux/${ID}/docker-ce.repo" \
-        || yum-config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" \
-        || exit 1
-    yum makecache || true
-    yum install -y docker-buildx-plugin docker-compose-plugin || exit 1
-else
-    echo "Unsupported package manager" >&2
-    exit 1
-fi
-docker compose version
-"""
-        out, err, code = self.ssh.run_sudo_script(script, timeout=300)
-        if code != 0:
-            raise RuntimeError(f"Failed to install docker compose plugin: {err or out}")
+        # Shared with the WEB proxy manager; see managers/docker_utils.py.
+        ensure_docker_compose(self.ssh)
 
     def install_protocol(self, protocol_type='telemt', port='443', tls_emulation=True, tls_domain="", max_connections=0):
         results = []
@@ -140,7 +97,10 @@ docker compose version
         self._ensure_docker_compose()
             
         results.append("Uploading Telemt files...")
-        local_dir = os.path.join(os.path.dirname(__file__), 'protocol_telemt')
+        # protocol_telemt/ lives at the repo root, not under managers/ — the
+        # upstream join was looking at /app/managers/protocol_telemt which
+        # doesn't exist. Step up one level from this file's directory.
+        local_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'protocol_telemt')
         remote_dir = "/opt/amnezia/telemt"
         self.ssh.run_sudo_command(f"mkdir -p {remote_dir}")
         self.ssh.run_sudo_command(f"chmod 755 {remote_dir}")
@@ -166,8 +126,22 @@ docker compose version
             
         config_content = re.sub(r'public_port\s*=\s*\d+', f'public_port = {port}', config_content)
         
-        # Remove default hello user
-        config_content = re.sub(r'^hello\s*=\s*".*?"', '', config_content, flags=re.MULTILINE)
+        # Replace the bundled `hello = "00000000..."` placeholder with a
+        # service entry that has a fresh random secret.  Telemt refuses to
+        # start when `[access.users]` is empty ("No users configured"), so if
+        # we stripped the default outright the container would crash-loop
+        # until the first real add_client. Keeping a service-named placeholder
+        # with an unguessable secret lets the proxy come up immediately:
+        #   - admin can't (and shouldn't) hand out the `_telemt_init` link;
+        #   - admin sees it in the UI client list and can delete it manually
+        #     once a real user has been added.
+        _placeholder_secret = secrets.token_hex(16)
+        config_content = re.sub(
+            r'^hello\s*=\s*".*?"\s*$',
+            f'_telemt_init = "{_placeholder_secret}"',
+            config_content,
+            flags=re.MULTILINE,
+        )
             
         self.ssh.upload_file_sudo(config_content, f"{remote_dir}/config.toml")
         
@@ -195,13 +169,127 @@ docker compose version
             "log": results
         }
 
+    # Cyrillic -> Latin so that a Russian display name survives as something
+    # readable instead of collapsing into underscores ("Иванов И.И." used to
+    # sanitize down to an empty key and get a random uuid name).
+    # Table shared with the WEB proxy manager; see managers/naming.py.
+    @classmethod
+    def _transliterate(cls, text):
+        return transliterate(text)
+
+    @staticmethod
+    def _is_safe_key(key):
+        """True if `key` is a TOML bare key Telemt will read as a plain name."""
+        return is_safe_key(key)
+
+    @classmethod
+    def _sanitize_username(cls, name):
+        """Coerce an arbitrary display name into a safe TOML bare key.
+
+        TOML bare keys only allow [A-Za-z0-9_-]; a literal dot is the
+        nested-table separator, so `foo.bar = "x"` parses as the table `[foo]`
+        with member `bar` rather than a scalar named `foo.bar`.  Telemt then
+        dies at startup with "invalid type: map, expected a string" and stays
+        in a restart loop -- i.e. one bad name takes down the proxy for every
+        user on the server.  Replace (rather than strip) unsafe runs so that
+        an all-non-ASCII name doesn't collapse into an empty key.
+        """
+        username = cls._transliterate((name or '').strip())
+        username = re.sub(r'[^A-Za-z0-9_-]+', '_', username.replace(' ', '_')).strip('_')
+        return username or ("user_" + uuid.uuid4().hex[:8])
+
+    @classmethod
+    def _repair_key(cls, key):
+        """Minimal fix for an existing config key: only touch unsafe ones.
+
+        Deliberately NOT _sanitize_username(): that one falls back to a random
+        uuid name, which would rename a live user (e.g. the legacy `_` key on
+        anubis) and desync them from the panel on every single write.
+        """
+        repaired = re.sub(r'[^A-Za-z0-9_-]+', '_', cls._transliterate(key)).strip('_')
+        return repaired or 'user_' + re.sub(r'[^a-f0-9]', '', uuid.uuid5(uuid.NAMESPACE_DNS, key).hex)[:8]
+
+    @classmethod
+    def _normalize_config_keys(cls, config_text):
+        """Rewrite unsafe usernames already present in a config.
+
+        Guards against configs written by an older panel build (whose regex
+        kept dots) and against hand edits made through the raw-config editor.
+        Returns (config_text, renames) where renames maps old -> new.
+        """
+        lines = config_text.split('\n')
+        section = None
+        renames = {}
+        for i, raw in enumerate(lines):
+            stripped = raw.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                section = stripped[1:-1].strip()
+                continue
+            if section not in cls.USER_KEYED_SECTIONS:
+                continue
+            # Disabled users are stored commented out; keep that marker intact.
+            m = re.match(r'^(\s*)(#\s*)?([^#\s=\[\]"\']+)(\s*=\s*)(.*)$', raw)
+            if not m:
+                continue
+            indent, comment, key, eq, value = m.groups()
+            if cls._is_safe_key(key):
+                continue
+            safe = cls._repair_key(key)
+            if safe == key:
+                continue
+            renames[key] = safe
+            lines[i] = f"{indent}{comment or ''}{safe}{eq}{value}"
+        return '\n'.join(lines), renames
+
+    @staticmethod
+    def _validate_config(config_text):
+        """Return a list of fatal problems; empty means Telemt should accept it."""
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - Python < 3.11
+            return []
+        try:
+            data = tomllib.loads(config_text)
+        except Exception as exc:
+            return [f"TOML syntax error: {exc}"]
+        users = (data.get('access') or {}).get('users') or {}
+        if not isinstance(users, dict):
+            return ["[access.users] is not a table"]
+        problems = [
+            f"user '{name}' has a {type(secret).__name__} value, expected a string"
+            for name, secret in users.items() if not isinstance(secret, str)
+        ]
+        if not users:
+            problems.append("no users configured - Telemt refuses to start with an empty [access.users]")
+        return problems
+
+    def _upload_config(self, config_text):
+        """Normalize, validate and only then push config.toml to the server.
+
+        Every write to config.toml goes through here so a malformed config
+        can never reach the server and crash-loop the container.
+        """
+        config_text = config_text.replace('\r\n', '\n')
+        config_text, renames = self._normalize_config_keys(config_text)
+        if renames:
+            logger.warning(
+                "Telemt config on %s contained unsafe usernames, normalized: %s",
+                getattr(self.ssh, 'host', '?'),
+                ', '.join(f"{old} -> {new}" for old, new in renames.items()),
+            )
+        problems = self._validate_config(config_text)
+        if problems:
+            raise ValueError("Refusing to write an invalid Telemt config: " + "; ".join(problems))
+        self.ssh.upload_file_sudo(config_text, self.CONFIG_PATH)
+        return renames
+
     def _get_server_config(self):
-        out, _, code = self.ssh.run_sudo_command(f"cat /opt/amnezia/telemt/config.toml")
+        out, _, code = self.ssh.run_sudo_command(f"cat {self.CONFIG_PATH}")
         if code != 0: return ""
         return out
 
     def save_server_config(self, protocol_type, config_content):
-        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_content)
         # Use SIGHUP (HUP) to reload MTProxy config without restarting the process/container.
         # This keeps the traffic statistics (octets) in memory.
         self.ssh.run_sudo_command(f"docker kill -s HUP {self.CONTAINER_NAME} || docker restart {self.CONTAINER_NAME}")
@@ -218,6 +306,39 @@ docker compose version
         if m: params['max_connections'] = int(m.group(1))
         
         return params
+
+    @staticmethod
+    def _is_tls_mode(config_text: str) -> bool:
+        """Detect whether the active config has only Fake-TLS mode enabled
+        (`[general.modes]` tls=true, classic=false, secure=false)."""
+        # Pull out just the [general.modes] section, so we don't accidentally
+        # match a `tls = true` line that belongs to some other table.
+        m = re.search(r'\[general\.modes\](.*?)(?=\n\[|\Z)', config_text, re.S)
+        if not m:
+            return False
+        section = m.group(1)
+        tls_match = re.search(r'^\s*tls\s*=\s*(true|false)', section, re.I | re.M)
+        return bool(tls_match and tls_match.group(1).lower() == 'true')
+
+    @staticmethod
+    def _build_fake_tls_secret(secret_hex: str, tls_domain: str) -> str:
+        """Wrap a 32-hex-char (16-byte) MTProxy secret into the Fake-TLS
+        on-wire format that the official Telegram client recognises:
+
+            ee + <16 random bytes hex> + <utf8(tls_domain) hex>
+
+        Returns the new hex secret. If inputs are malformed, returns the
+        secret unchanged so we never produce a worse link than before."""
+        if not secret_hex or not tls_domain:
+            return secret_hex
+        try:
+            # Reject anything that isn't exactly 16 bytes of hex — Fake-TLS
+            # requires that fixed length for the random suffix.
+            if len(secret_hex) != 32 or not all(c in '0123456789abcdefABCDEF' for c in secret_hex):
+                return secret_hex
+            return 'ee' + secret_hex.lower() + tls_domain.encode('utf-8').hex()
+        except Exception:
+            return secret_hex
 
     def remove_container(self, protocol_type=None):
         self.ssh.run_sudo_command(f"docker rm -f {self.CONTAINER_NAME}")
@@ -306,9 +427,8 @@ docker compose version
         return users
 
     def add_client(self, protocol_type, name, host='', port='', **kwargs):
-        username = re.sub(r'[^a-zA-Z0-9_.-]', '', name.replace(' ', '_'))
-        if not username: username = "user_" + uuid.uuid4().hex[:8]
-        
+        username = self._sanitize_username(name)
+
         config_text = self._get_server_config()
         current_users = self._parse_users_from_config(config_text)
         idx = 1
@@ -353,17 +473,24 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_text)
         
         # 2. Call API for immediate effect
         self._api_request("POST", "/v1/users", data=api_payload)
         
         # Fetch the official link from API (it includes TLS emulation padding like 'ee...' if enabled)
         link = self.get_client_config(protocol_type, username, host, port)
-        
-        # Extreme fallback if API is slow or 404
+
+        # Extreme fallback if API is slow or 404 (e.g. container in restart loop
+        # right after install). Without this, admins get a flat secret that
+        # Telemt refuses in Fake-TLS-only mode. Reconstruct the proper format
+        # from what we already know locally.
         if link == "Not found":
-            link = f"tg://proxy?server={host}&port={port}&secret={secret}"
+            params = self._parse_telemt_params(config_text)
+            wire_secret = secret
+            if self._is_tls_mode(config_text) and params.get('tls_domain'):
+                wire_secret = self._build_fake_tls_secret(secret, params['tls_domain'])
+            link = f"tg://proxy?server={host}&port={port}&secret={wire_secret}"
         
         return {
             "client_id": username,
@@ -410,7 +537,7 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config(config_text)
         
         # API call
         self._api_request("PATCH", f"/v1/users/{client_id}", data=api_payload)
@@ -477,7 +604,7 @@ docker compose version
             if stripped.startswith(f"{client_id} ") or stripped.startswith(f"{client_id}="):
                 continue
             new_lines.append(line)
-        self.ssh.upload_file_sudo('\n'.join(new_lines).replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config('\n'.join(new_lines))
 
     def toggle_client(self, protocol_type, client_id, enable, restart=True):
         # API doesn't have a direct "toggle", so we either set a huge quota or remove/re-add
@@ -499,7 +626,7 @@ docker compose version
                     line = base_line if enable else f"# {base_line}"
             new_lines.append(line)
         
-        self.ssh.upload_file_sudo('\n'.join(new_lines).replace('\r\n', '\n'), "/opt/amnezia/telemt/config.toml")
+        self._upload_config('\n'.join(new_lines))
         
         if enable:
             # If enabling, we re-add via API since it might have been deleted from memory
@@ -523,10 +650,19 @@ docker compose version
             if links.get('tls'): return links['tls'][0]
             if links.get('secure'): return links['secure'][0]
             if links.get('classic'): return links['classic'][0]
-            
+
+        # API unreachable — try to assemble the link from the config we have
+        # on disk (matches the Fake-TLS format Telemt would generate itself).
         clients = self.get_clients(protocol_type)
         c = next((c for c in clients if c['clientId'] == client_id), None)
         if c:
             secret = c.get('userData', {}).get('token', '')
-            if secret: return f"tg://proxy?server={host}&port={port}&secret={secret}"
+            if secret:
+                config_text = self._get_server_config()
+                wire_secret = secret
+                if config_text and self._is_tls_mode(config_text):
+                    params = self._parse_telemt_params(config_text)
+                    if params.get('tls_domain'):
+                        wire_secret = self._build_fake_tls_secret(secret, params['tls_domain'])
+                return f"tg://proxy?server={host}&port={port}&secret={wire_secret}"
         return "Not found"

@@ -9,6 +9,8 @@
         <h1 class="section-title" style="margin-bottom:0; flex-shrink: 0;">
             <span class="icon">👥</span>
             {{ _('users_title') }}
+            <span id="usersTotalCount"
+                  style="font-size: 0.7em; color: var(--text-muted); font-weight: 500; margin-left: 6px;"></span>
         </h1>
 
         <div style="flex: 1; min-width: 250px; max-width: 500px; position: relative;">
@@ -16,6 +18,20 @@
                 oninput="handleSearch(this.value)" style="padding-left: 40px;">
             <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">🔍</span>
         </div>
+
+        {# Per-page size selector — placed next to search so admins see it
+           without scrolling to the bottom of the page. Mirrored to URL
+           (?size=...) and persisted across reloads via _writeStateToUrl. #}
+        <label style="color: var(--text-muted); font-size: 0.9rem; display:inline-flex; align-items:center; gap:6px; flex-shrink:0;">
+            {{ _('per_page_label') }}
+            <select id="pageSizeSelect" class="form-select" style="padding: 6px 28px 6px 10px; width: auto;"
+                    onchange="changePageSize(parseInt(this.value, 10))">
+                <option value="10">10</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+            </select>
+        </label>
 
         {% if current_user.role == 'admin' %}
         <button class="btn btn-primary" onclick="openModal('addUserModal')" style="flex-shrink: 0;">
@@ -26,16 +42,17 @@
 
     <div id="usersContainer" class="hidden">
         <div class="clients-list" id="usersGrid"
-            style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
-            <!-- Users will be loaded here via JS -->
+             style="display: flex; flex-direction: column; gap: var(--space-sm);">
+            <!-- Users will be loaded here via JS — single column so each
+                 user is one row, easier to scan at high counts. -->
         </div>
 
         <div id="pagination"
-            style="display: flex; justify-content: center; align-items: center; gap: var(--space-md); margin-top: var(--space-xl);">
-            <button class="btn btn-secondary btn-sm" id="prevPage" onclick="changePage(-1)">{{ _('prev_page')
-                }}</button>
-            <span id="pageInfo" style="font-weight: 600; font-size: 0.9rem;"></span>
+            style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: var(--space-xl);">
+            <button class="btn btn-secondary btn-sm" id="prevPage" onclick="changePage(-1)">{{ _('prev_page') }}</button>
+            <div id="pageNumbers" style="display:flex; align-items:center; gap:4px;"></div>
             <button class="btn btn-secondary btn-sm" id="nextPage" onclick="changePage(1)">{{ _('next_page') }}</button>
+            <span id="pageInfo" style="margin-left: 8px; color: var(--text-muted); font-size: 0.85rem;"></span>
         </div>
     </div>
 
@@ -390,18 +407,111 @@
 
     const serversData = {{ servers | tojson }};
 
+    // Page state is mirrored to the URL query string so reload / browser
+    // back-forward / bookmarks all land on the same page the admin was
+    // looking at. We use ?page=N&q=... rather than the hash so server-side
+    // tools see it too if needed.
+    // Allowed page-size choices — keep in sync with the <select> options
+    // in the template, otherwise an unexpected `?size=` would silently fail.
+    const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+
+    function _readStateFromUrl() {
+        const url = new URL(location.href);
+        const p = parseInt(url.searchParams.get('page') || '1', 10);
+        if (Number.isFinite(p) && p >= 1) currentPage = p;
+        const q = url.searchParams.get('q') || '';
+        if (q) {
+            searchQuery = q;
+            const input = document.getElementById('userSearch');
+            if (input) input.value = q;
+        }
+        const s = parseInt(url.searchParams.get('size') || '', 10);
+        if (PAGE_SIZE_OPTIONS.includes(s)) pageSize = s;
+        const sel = document.getElementById('pageSizeSelect');
+        if (sel) sel.value = String(pageSize);
+    }
+
+    function _writeStateToUrl() {
+        const url = new URL(location.href);
+        if (currentPage > 1) url.searchParams.set('page', String(currentPage));
+        else url.searchParams.delete('page');
+        if (searchQuery) url.searchParams.set('q', searchQuery);
+        else url.searchParams.delete('q');
+        // Only persist a non-default size — keeps URLs short for the
+        // overwhelmingly common case where the admin is fine with 10/page.
+        if (pageSize !== 10) url.searchParams.set('size', String(pageSize));
+        else url.searchParams.delete('size');
+        history.replaceState(null, '', url.toString());
+    }
+
+    function changePageSize(n) {
+        if (!PAGE_SIZE_OPTIONS.includes(n)) return;
+        if (n === pageSize) return;
+        pageSize = n;
+        // Reset to page 1 — recomputing "the same user on a different page
+        // size" usually isn't what the admin wants; they're widening/narrowing
+        // the view to see more or less at once.
+        currentPage = 1;
+        _writeStateToUrl();
+        refreshUsersList();
+    }
+
     function handleSearch(val) {
         clearTimeout(searchTimeout);
         searchTimeout = setTimeout(() => {
             searchQuery = val;
             currentPage = 1;
+            _writeStateToUrl();
             refreshUsersList();
         }, 300);
     }
 
     function changePage(delta) {
         currentPage += delta;
+        _writeStateToUrl();
         refreshUsersList();
+    }
+
+    function goToPage(n) {
+        if (n < 1) n = 1;
+        if (n === currentPage) return;
+        currentPage = n;
+        _writeStateToUrl();
+        refreshUsersList();
+    }
+
+    function _renderPageNumbers(curr, total) {
+        // Pick which page numbers to show. With few pages we list them all;
+        // with many we use a sliding window around the current page plus
+        // bookends (1 and last) with "…" gaps. Keeps the bar from
+        // exploding when the user has 50+ pages.
+        const container = document.getElementById('pageNumbers');
+        if (!container) return;
+        if (total <= 1) { container.innerHTML = ''; return; }
+
+        const NEAR = 2;  // how many pages to show on each side of current
+        const pages = new Set([1, total, curr]);
+        for (let i = curr - NEAR; i <= curr + NEAR; i++) {
+            if (i >= 1 && i <= total) pages.add(i);
+        }
+        const sorted = [...pages].sort((a, b) => a - b);
+
+        const parts = [];
+        let prev = 0;
+        for (const p of sorted) {
+            if (prev && p > prev + 1) {
+                parts.push(`<span style="color:var(--text-muted); padding:0 4px;">…</span>`);
+            }
+            const isCurr = p === curr;
+            parts.push(
+                `<button class="btn btn-${isCurr ? 'primary' : 'secondary'} btn-sm"
+                         onclick="goToPage(${p})"
+                         style="min-width: 36px; padding: 6px 10px;"
+                         ${isCurr ? 'aria-current="page"' : ''}>${p}</button>`
+            );
+            prev = p;
+        }
+        container.innerHTML = parts.join('');
     }
 
     async function refreshUsersList() {
@@ -416,6 +526,20 @@
 
         try {
             const data = await apiCall(`/api/users?search=${encodeURIComponent(searchQuery)}&page=${currentPage}&size=${pageSize}`);
+
+            // Total count next to the "Users" header — show as plain number,
+            // or "shown / total" when the admin has narrowed via search so
+            // they don't think users vanished.
+            const totalEl = document.getElementById('usersTotalCount');
+            if (totalEl) {
+                if (searchQuery) {
+                    totalEl.textContent = `(${data.total})`;
+                    totalEl.title = _('search_match_count_title') || '';
+                } else {
+                    totalEl.textContent = `(${data.total})`;
+                    totalEl.title = '';
+                }
+            }
 
             if (data.users.length === 0) {
                 loading.classList.add('hidden');
@@ -482,7 +606,7 @@
                              ${u.traffic_reset_strategy !== 'never' ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>` : ''}
                         </div>
                     </div>
-                    <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; max-width: 140px;">
+                    <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; gap:4px;">
                         {% if current_user.role == 'admin' %}
                         <button class="btn btn-secondary btn-sm btn-icon" 
                                 onclick="openAddConnectionForUser('${u.id}', '${u.username}')" 
@@ -495,6 +619,11 @@
                                 data-enabled="${u.share_enabled ? 'true' : 'false'}"
                                 data-haspassword="${u.has_share_password ? 'true' : 'false'}"
                                 title="${_('share_access')}">📤</button>
+                        ${u.email ? `
+                            <button class="btn btn-secondary btn-sm btn-icon"
+                                    onclick="openEmailConfigsModal('${u.id}', '${u.username.replace(/'/g, "\\'")}', '${u.email.replace(/'/g, "\\'")}')"
+                                    title="Email configs to user">📧</button>
+                        ` : ''}
                         ${u.id !== "{{ current_user.id }}" ? `
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleUser(this.dataset)"
                                     data-id="${u.id}" data-enable="${u.enabled ? 'false' : 'true'}"
@@ -512,6 +641,7 @@
             document.getElementById('pageInfo').textContent = _('page_info').replace('{}', data.page).replace('{}', data.pages || 1);
             document.getElementById('prevPage').disabled = (data.page <= 1);
             document.getElementById('nextPage').disabled = (data.page >= data.pages);
+            _renderPageNumbers(data.page, data.pages || 1);
 
             loading.classList.add('hidden');
             container.classList.remove('hidden');
@@ -520,8 +650,12 @@
         }
     }
 
-    // Call on load
-    document.addEventListener('DOMContentLoaded', refreshUsersList);
+    // Call on load — pull page/search from URL first so a refresh lands us
+    // back where we were instead of resetting to page 1.
+    document.addEventListener('DOMContentLoaded', () => {
+        _readStateFromUrl();
+        refreshUsersList();
+    });
 
     function updateProtocols(serverId, selectId, groupId = null) {
         const select = document.getElementById(selectId);
@@ -538,10 +672,12 @@
         let count = 0;
 
         for (const [key, info] of Object.entries(protocols)) {
-            if (info.installed) {
+            // Plain 'awg' is hidden in the fork (duplicate of awg2); existing
+            // installs are still shown so they can be managed/removed.
+            if (info.installed && (key !== 'awg' || info.container_running)) {
                 const opt = document.createElement('option');
                 opt.value = key;
-                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase())));
+                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : (key === 'webproxy' ? 'Telegram WEB Proxy' : key.toUpperCase()))));
                 select.appendChild(opt);
                 count++;
             }
@@ -637,7 +773,7 @@
                 switchConfigTab('conf');
                 closeModal('addUserModal');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             } else {
                 setTimeout(() => window.location.reload(), 500);
             }
@@ -765,7 +901,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             }
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -777,7 +913,13 @@
         }
     }
 
+    // Remembered so the modal can redraw itself after a connection is deleted.
+    let _connsUserId = null;
+    let _connsUserName = '';
+
     async function viewUserConnections(userId, username) {
+        _connsUserId = userId;
+        _connsUserName = username;
         document.getElementById('userConnsTitle').textContent = `${_('connections')} — ${username}`;
         const listEl = document.getElementById('userConnsList');
         listEl.innerHTML = `<div style="text-align:center;padding:var(--space-lg);color:var(--text-muted);">${_('loading')}</div>`;
@@ -798,18 +940,38 @@
                                 <div class="client-name">${c.name || 'Connection'}</div>
                                 <div class="client-meta">
                                     <span>🖥 ${c.server_name || ''}</span>
-                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())))}</span>
+                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : (c.protocol === 'webproxy' ? 'Telegram WEB Proxy' : c.protocol.toUpperCase()))))}</span>
                                 </div>
                             </div>
                         </div>
                         <div class="client-actions">
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showUserConnectionConfig(${c.server_id}, '${c.client_id}', '${c.protocol}', '${(c.name || 'VPN').replace(/'/g, "\\'")}')" title="${_('config')}">📄</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="deleteUserConnection(${c.server_id}, '${c.client_id}', '${c.protocol}', '${(c.name || 'VPN').replace(/'/g, "\\'")}', '${(c.server_name || '').replace(/'/g, "\\'")}')" title="${_('delete')}">🗑</button>
                         </div>
                     </div>
                 `;
             });
         } catch (err) {
             listEl.innerHTML = `<div style="color:#ef4444;padding:var(--space-md);">${_('error')}: ${err.message}</div>`;
+        }
+    }
+
+    async function deleteUserConnection(serverId, clientId, protocol, name, serverName) {
+        // A user often has the same connection name on several servers, so the
+        // prompt spells out which server this one lives on.
+        const target = serverName ? `${name} — ${serverName}` : name;
+        if (!confirm(`${_('delete_connection_confirm')}\n\n${target}`)) return;
+        try {
+            await apiCall(`/api/servers/${serverId}/connections/remove`, 'POST', {
+                protocol: protocol, client_id: clientId,
+            });
+            showToast(_('connection_deleted'), 'success');
+            // Redraw the modal, then refresh the row behind it so the
+            // connection counter doesn't go stale.
+            if (_connsUserId !== null) await viewUserConnections(_connsUserId, _connsUserName);
+            refreshUsersList();
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
         }
     }
 
@@ -824,13 +986,31 @@
         document.getElementById(panels[tab]).classList.add('active');
     }
 
-    function generateQR(text) {
+    let _qrRotateTimer = null;
+    function generateQR(payload) {
         const container = document.getElementById('qrCode');
         container.innerHTML = '';
-        try {
-            new QRCode(container, { text, width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
-        } catch (e) {
-            container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+        if (_qrRotateTimer) { clearInterval(_qrRotateTimer); _qrRotateTimer = null; }
+        const chunks = Array.isArray(payload) ? payload : [payload];
+        let idx = 0;
+        let counterEl = null;
+        if (chunks.length > 1) {
+            counterEl = document.createElement('div');
+            counterEl.style.cssText = 'text-align:center;margin-top:0.5rem;color:var(--text-muted);font-size:0.85rem;';
+            container.insertAdjacentElement('afterend', counterEl);
+        }
+        const render = () => {
+            container.innerHTML = '';
+            try {
+                new QRCode(container, { text: chunks[idx], width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
+                if (counterEl) counterEl.textContent = `${idx + 1} / ${chunks.length}`;
+            } catch (e) {
+                container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+            }
+        };
+        render();
+        if (chunks.length > 1) {
+            _qrRotateTimer = setInterval(() => { idx = (idx + 1) % chunks.length; render(); }, 750);
         }
     }
     async function showUserConnectionConfig(serverId, clientId, protocol, connName) {
@@ -848,10 +1028,150 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.qr_chunks && result.qr_chunks.length ? result.qr_chunks : result.config);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+</script>
+
+<!-- ===== Email Configs Modal ===== -->
+<div class="modal-backdrop" id="emailConfigsModal">
+    <div class="modal" style="max-width: 560px;">
+        <div class="modal-header">
+            <h2 class="modal-title">📧 Email configs</h2>
+            <button class="modal-close" onclick="closeModal('emailConfigsModal')">×</button>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Recipient</label>
+            <input type="email" class="form-input" id="emailToInput" readonly
+                   style="opacity:0.7;">
+            <div class="form-hint" id="emailUserHint" style="margin-top:4px;"></div>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Subject</label>
+            <input type="text" class="form-input" id="emailSubjectInput"
+                   value="Your VPN configuration"
+                   placeholder="Your VPN configuration">
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Message (optional)</label>
+            <textarea class="form-textarea" id="emailMessageInput" rows="3"
+                      placeholder="Hi! Here are your VPN configs. Tap the .conf file or scan the QR."></textarea>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>Connections to send</span>
+                <span style="font-weight:400; font-size:0.8rem; color:var(--text-muted);">
+                    <a href="#" onclick="toggleAllEmailConns(true); return false;">all</a> ·
+                    <a href="#" onclick="toggleAllEmailConns(false); return false;">none</a>
+                </span>
+            </label>
+            <div id="emailConnList" style="max-height:240px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; padding:var(--space-sm);">
+                <div style="color:var(--text-muted); font-size:0.85rem;">Loading...</div>
+            </div>
+            <div class="form-hint">For each: a .conf (if applicable) + a PNG QR will be attached.</div>
+        </div>
+
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('emailConfigsModal')">{{ _('cancel') }}</button>
+            <button type="button" class="btn btn-primary" id="emailSendBtn" onclick="sendEmailConfigs()">
+                <span id="emailSendBtnText">Send</span>
+                <div class="spinner hidden" id="emailSendSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let _emailTargetUserId = null;
+
+    async function openEmailConfigsModal(userId, username, email) {
+        _emailTargetUserId = userId;
+        document.getElementById('emailToInput').value = email;
+        document.getElementById('emailUserHint').textContent = `User: ${username}`;
+        document.getElementById('emailSubjectInput').value = 'Your VPN configuration';
+        document.getElementById('emailMessageInput').value = '';
+        const list = document.getElementById('emailConnList');
+        list.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem;">Loading...</div>';
+        openModal('emailConfigsModal');
+
+        try {
+            const res = await fetch(`/api/users/${userId}/connections`, { credentials: 'same-origin' });
+            const data = await res.json();
+            const conns = data.connections || [];
+            if (conns.length === 0) {
+                list.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem;">No connections — create one first.</div>';
+                return;
+            }
+            // Pre-tick everything by default — most flow is "send them all the configs they have".
+            list.innerHTML = conns.map(c => {
+                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG'
+                    : c.protocol === 'awg2' ? 'AmneziaWG 2.0'
+                    : c.protocol === 'awg_legacy' ? 'AWG Legacy'
+                    : c.protocol === 'xray' ? 'Xray'
+                    : c.protocol === 'webproxy' ? 'Telegram WEB Proxy'
+                    : c.protocol === 'telemt' ? 'Telemt'
+                    : c.protocol.toUpperCase();
+                const server = c.server_name || '?';
+                return `
+                    <label style="display:flex; align-items:center; gap:var(--space-sm); padding:4px 0; cursor:pointer;">
+                        <input type="checkbox" class="email-conn-cb" value="${c.id}" checked>
+                        <span style="flex:1;">
+                            <strong>${c.name || 'connection'}</strong>
+                            <span style="color:var(--text-muted); font-size:0.8rem;"> · ${protoLabel} · ${server}</span>
+                        </span>
+                    </label>
+                `;
+            }).join('');
+        } catch (e) {
+            list.innerHTML = `<div style="color:var(--danger); font-size:0.85rem;">Error: ${e.message}</div>`;
+        }
+    }
+
+    function toggleAllEmailConns(checked) {
+        document.querySelectorAll('.email-conn-cb').forEach(cb => { cb.checked = checked; });
+    }
+
+    async function sendEmailConfigs() {
+        if (!_emailTargetUserId) return;
+        const ids = Array.from(document.querySelectorAll('.email-conn-cb:checked')).map(cb => cb.value);
+        if (ids.length === 0) {
+            showToast('Pick at least one connection', 'error');
+            return;
+        }
+        const btn = document.getElementById('emailSendBtn');
+        const text = document.getElementById('emailSendBtnText');
+        const spin = document.getElementById('emailSendSpinner');
+        btn.disabled = true; text.textContent = 'Sending...'; spin.classList.remove('hidden');
+        try {
+            const res = await fetch(`/api/users/${_emailTargetUserId}/email/send`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({
+                    connection_ids: ids,
+                    subject: document.getElementById('emailSubjectInput').value,
+                    message: document.getElementById('emailMessageInput').value,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+            let msg = `Sent ${data.sent_count} config(s) to ${data.to}`;
+            if (data.failed_connections && data.failed_connections.length) {
+                msg += ` (failed: ${data.failed_connections.length})`;
+            }
+            showToast(msg, 'success');
+            closeModal('emailConfigsModal');
+        } catch (e) {
+            showToast('Error: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false; text.textContent = 'Send'; spin.classList.add('hidden');
         }
     }
 </script>

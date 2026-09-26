@@ -16,19 +16,49 @@
     <div class="server-grid" id="serverGrid">
         {% for server in servers %}
         <div class="card card-hover server-card" id="server-{{ loop.index0 }}" data-idx="{{ loop.index0 }}"
-            data-name="{{ server.name }}" data-host="{{ server.host }}" data-port="{{ server.ssh_port }}"
+            data-name="{{ server.name }}" data-host="{{ server.host }}"
+            data-client-host="{{ server.client_host or '' }}" data-port="{{ server.ssh_port }}"
             data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
+            data-description="{{ server.description or '' }}"
+            data-allow-vovka="{{ '1' if server.allow_vovka else '0' }}"
             draggable="true">
             <div class="server-meta">
                 <div class="server-icon">🖥</div>
+                {% if server.allow_vovka %}
+                {# Vovka-ownership marker — sits right next to the server icon
+                   so it reads as a property OF the server (whose it is), not
+                   as a service running ON it (which is how it looked when the
+                   badge was down in the protocols row). #}
+                <img src="/static/vovka.png" alt="Vovka"
+                     title="{{ _('allow_vovka_label') }}"
+                     style="width:40px; height:40px; border-radius:50%; object-fit:cover;
+                            flex-shrink:0; border:1px solid var(--border, #e5e5e5);"
+                     onerror="this.replaceWith(Object.assign(document.createElement('span'), {
+                         textContent: '👦',
+                         title: '{{ _('allow_vovka_label') }}',
+                         style: 'font-size:36px; line-height:1; flex-shrink:0;'
+                     }));">
+                {% endif %}
                 <div style="min-width: 0; flex: 1;">
                     <div class="server-name">
                         <span class="ping-dot ping-pending" id="ping-{{ loop.index0 }}"
                             title="{{ _('ping_checking') }}"></span>
                         <span>{{ server.name }}</span>
+                        {% if server.country_code %}
+                        <span class="server-country" title="{{ server.country_name or server.country_code }}"
+                              style="font-size:0.85rem; margin-left:6px;">
+                            {{ server.country_code | country_flag }} {{ server.country_code }}
+                        </span>
+                        {% endif %}
                         <span class="ping-ms text-muted" id="ping-ms-{{ loop.index0 }}"></span>
                     </div>
                     <div class="server-host">{{ server.host }}:{{ server.ssh_port }}</div>
+                    {% if server.description %}
+                    <div class="server-description text-muted"
+                         style="margin-top:4px; font-size:0.8rem; line-height:1.3; word-wrap:break-word; white-space:pre-line;">
+                        {{ server.description }}
+                    </div>
+                    {% endif %}
                 </div>
             </div>
 
@@ -97,6 +127,20 @@
                 <input class="form-input" type="text" id="editServerName">
             </div>
 
+            <div class="form-group">
+                <label class="form-label">{{ _('server_description') }}</label>
+                <textarea class="form-textarea" id="editServerDescription" rows="2"
+                          placeholder="{{ _('server_description_placeholder') }}"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;">
+                    <input type="checkbox" id="editServerAllowVovka">
+                    <span>{{ _('allow_vovka_label') }}</span>
+                </label>
+                <div class="form-hint">{{ _('allow_vovka_hint') }}</div>
+            </div>
+
             <div class="form-row">
                 <div class="form-group">
                     <label class="form-label">{{ _('ssh_host') }}</label>
@@ -106,6 +150,12 @@
                     <label class="form-label">{{ _('ssh_port') }}</label>
                     <input class="form-input" type="number" id="editServerPort" min="1" max="65535">
                 </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('client_host') }}</label>
+                <input class="form-input" type="text" id="editServerClientHost" placeholder="vpn.example.com">
+                <div class="form-hint">{{ _('client_host_hint') }}</div>
             </div>
 
             <div class="form-group">
@@ -162,6 +212,20 @@
                 <input class="form-input" type="text" id="serverName" placeholder="My VPN Server">
             </div>
 
+            <div class="form-group">
+                <label class="form-label">{{ _('server_description') }}</label>
+                <textarea class="form-textarea" id="serverDescription" rows="2"
+                          placeholder="{{ _('server_description_placeholder') }}"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;">
+                    <input type="checkbox" id="serverAllowVovka">
+                    <span>{{ _('allow_vovka_label') }}</span>
+                </label>
+                <div class="form-hint">{{ _('allow_vovka_hint') }}</div>
+            </div>
+
             <div class="form-row">
                 <div class="form-group">
                     <label class="form-label">{{ _('ssh_host') }}</label>
@@ -171,6 +235,12 @@
                     <label class="form-label">{{ _('ssh_port') }}</label>
                     <input class="form-input" type="number" id="serverPort" value="22" min="1" max="65535">
                 </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('client_host') }}</label>
+                <input class="form-input" type="text" id="serverClientHost" placeholder="vpn.example.com">
+                <div class="form-hint">{{ _('client_host_hint') }}</div>
             </div>
 
             <div class="form-group">
@@ -238,7 +308,10 @@
         try {
             const data = {
                 name: document.getElementById('serverName').value,
+                description: document.getElementById('serverDescription').value,
+                allow_vovka: document.getElementById('serverAllowVovka').checked,
                 host: document.getElementById('serverHost').value,
+                client_host: document.getElementById('serverClientHost').value,
                 ssh_port: parseInt(document.getElementById('serverPort').value) || 22,
                 username: document.getElementById('serverUser').value,
                 password: document.getElementById('serverPassword').value,
@@ -286,7 +359,10 @@
         if (!card) return;
         document.getElementById('editServerIdx').value = card.dataset.idx;
         document.getElementById('editServerName').value = card.dataset.name || '';
+        document.getElementById('editServerDescription').value = card.dataset.description || '';
+        document.getElementById('editServerAllowVovka').checked = card.dataset.allowVovka === '1';
         document.getElementById('editServerHost').value = card.dataset.host || '';
+        document.getElementById('editServerClientHost').value = card.dataset.clientHost || '';
         document.getElementById('editServerPort').value = card.dataset.port || '22';
         document.getElementById('editServerUser').value = card.dataset.username || '';
         document.getElementById('editServerPassword').value = '';
@@ -314,7 +390,10 @@
         try {
             const body = {
                 name: document.getElementById('editServerName').value,
+                description: document.getElementById('editServerDescription').value,
+                allow_vovka: document.getElementById('editServerAllowVovka').checked,
                 host: document.getElementById('editServerHost').value,
+                client_host: document.getElementById('editServerClientHost').value,
                 ssh_port: parseInt(document.getElementById('editServerPort').value) || 22,
                 username: document.getElementById('editServerUser').value,
                 // Empty -> null means "leave unchanged" on the backend.
